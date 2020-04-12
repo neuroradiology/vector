@@ -1,39 +1,76 @@
 use crate::{
     event::Event,
-    topology::config::{DataType, GlobalOptions, SourceConfig},
+    kafka::{KafkaCompression, KafkaTlsConfig},
+    shutdown::ShutdownSignal,
+    topology::config::{DataType, GlobalOptions, SourceConfig, SourceDescription},
 };
 use bytes::Bytes;
-use futures::{future, sync::mpsc, Future, Poll, Sink, Stream};
+use futures::compat::Compat;
+use futures01::{future, sync::mpsc, Future, Poll, Sink, Stream};
 use owning_ref::OwningHandle;
 use rdkafka::{
     config::ClientConfig,
     consumer::{Consumer, DefaultConsumerContext, MessageStream, StreamConsumer},
-    error::KafkaResult,
+    error::KafkaError,
     message::{BorrowedMessage, Message},
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use snafu::{ResultExt, Snafu};
+use std::{collections::HashMap, sync::Arc};
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Snafu)]
+enum BuildError {
+    #[snafu(display("Could not create Kafka consumer: {}", source))]
+    KafkaCreateError { source: rdkafka::error::KafkaError },
+    #[snafu(display("Could not subscribe to Kafka topics: {}", source))]
+    KafkaSubscribeError { source: rdkafka::error::KafkaError },
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct KafkaSourceConfig {
     bootstrap_servers: String,
     topics: Vec<String>,
     group_id: String,
+    compression: Option<KafkaCompression>,
     #[serde(default = "default_auto_offset_reset")]
     auto_offset_reset: String,
     #[serde(default = "default_session_timeout_ms")]
     session_timeout_ms: u64,
+    #[serde(default = "default_socket_timeout_ms")]
+    socket_timeout_ms: u64,
+    #[serde(default = "default_fetch_wait_max_ms")]
+    fetch_wait_max_ms: u64,
+    #[serde(default = "default_commit_interval_ms")]
+    commit_interval_ms: u64,
     host_key: Option<String>,
     key_field: Option<String>,
+    librdkafka_options: Option<HashMap<String, String>>,
+    tls: Option<KafkaTlsConfig>,
 }
 
 fn default_session_timeout_ms() -> u64 {
     10000 // default in librdkafka
 }
 
+fn default_socket_timeout_ms() -> u64 {
+    60000 // default in librdkafka
+}
+
+fn default_fetch_wait_max_ms() -> u64 {
+    100 // default in librdkafka
+}
+
+fn default_commit_interval_ms() -> u64 {
+    5000 // default in librdkafka
+}
+
 fn default_auto_offset_reset() -> String {
     "largest".into() // default in librdkafka
+}
+
+inventory::submit! {
+    SourceDescription::new_without_default::<KafkaSourceConfig>("kafka")
 }
 
 #[typetag::serde(name = "kafka")]
@@ -42,20 +79,25 @@ impl SourceConfig for KafkaSourceConfig {
         &self,
         _name: &str,
         _globals: &GlobalOptions,
+        _shutdown: ShutdownSignal,
         out: mpsc::Sender<Event>,
-    ) -> Result<super::Source, String> {
+    ) -> crate::Result<super::Source> {
         kafka_source(self.clone(), out)
     }
 
     fn output_type(&self) -> DataType {
         DataType::Log
     }
+
+    fn source_type(&self) -> &'static str {
+        "kafka"
+    }
 }
 
 fn kafka_source(
     config: KafkaSourceConfig,
     out: mpsc::Sender<Event>,
-) -> Result<super::Source, String> {
+) -> crate::Result<super::Source> {
     let consumer = Arc::new(create_consumer(config.clone())?);
     let source = future::lazy(move || {
         let consumer_ref = Arc::clone(&consumer);
@@ -64,7 +106,7 @@ fn kafka_source(
         let stream = OwnedConsumerStream {
             upstream: OwningHandle::new_with_fn(consumer, |c| {
                 let cf = unsafe { &*c };
-                Box::new(cf.start())
+                Box::new(Compat::new(cf.start()))
             }),
         };
 
@@ -72,8 +114,7 @@ fn kafka_source(
             .then(move |message| {
                 match message {
                     Err(e) => Err(error!(message = "Error reading message from Kafka", error = ?e)),
-                    Ok(Err(e)) => Err(error!(message = "Kafka returned error", error = ?e)),
-                    Ok(Ok(msg)) => {
+                    Ok(msg) => {
                         let payload = match msg.payload_view::<[u8]>() {
                             None => return Err(()), // skip messages with empty payload
                             Some(Err(e)) => {
@@ -89,15 +130,14 @@ fn kafka_source(
                                 Some(Err(e)) => {
                                     return Err(error!(message = "Cannot extract key", error = ?e))
                                 }
-                                Some(Ok(key)) => event
-                                    .as_mut_log()
-                                    .insert_implicit(key_field.clone().into(), key.into()),
+                                Some(Ok(key)) => {
+                                    event.as_mut_log().insert(key_field.clone(), key);
+                                }
                             }
                         }
-
-                        consumer_ref
-                            .store_offset(&msg)
-                            .map_err(|e| error!(message = "Cannot store offset", error = ?e))?;
+                        consumer_ref.store_offset(&msg).map_err(
+                            |e| error!(message = "Cannot store offset for the message", error = ?e),
+                        )?;
                         Ok(event)
                     }
                 }
@@ -109,34 +149,51 @@ fn kafka_source(
     Ok(Box::new(source))
 }
 
-fn create_consumer(config: KafkaSourceConfig) -> Result<StreamConsumer, String> {
-    let consumer: StreamConsumer = ClientConfig::new()
+fn create_consumer(config: KafkaSourceConfig) -> crate::Result<StreamConsumer> {
+    let mut client_config = ClientConfig::new();
+    client_config
         .set("group.id", &config.group_id)
         .set("bootstrap.servers", &config.bootstrap_servers)
         .set("auto.offset.reset", &config.auto_offset_reset)
         .set("session.timeout.ms", &config.session_timeout_ms.to_string())
+        .set("socket.timeout.ms", &config.socket_timeout_ms.to_string())
+        .set("fetch.wait.max.ms", &config.fetch_wait_max_ms.to_string())
         .set("enable.partition.eof", "false")
-        .set("enable.auto.commit", "false")
-        .set("client.id", "vector")
-        .create()
-        .map_err(|e| format!("Cannot create Kafka consumer: {:?}", e))?;
+        .set("enable.auto.commit", "true")
+        .set(
+            "auto.commit.interval.ms",
+            &config.commit_interval_ms.to_string(),
+        )
+        .set("enable.auto.offset.store", "false")
+        .set("client.id", "vector");
 
+    if let Some(tls) = &config.tls {
+        tls.apply(&mut client_config)?;
+    }
+
+    if let Some(librdkafka_options) = config.librdkafka_options {
+        for (key, value) in librdkafka_options.into_iter() {
+            client_config.set(key.as_str(), value.as_str());
+        }
+    }
+
+    let consumer: StreamConsumer = client_config.create().context(KafkaCreateError)?;
     let topics: Vec<&str> = config.topics.iter().map(|s| s.as_str()).collect();
-    consumer
-        .subscribe(&topics)
-        .map_err(|e| format!("Cannot subscribe to topics: {:?}", e))?;
+    consumer.subscribe(&topics).context(KafkaSubscribeError)?;
 
     Ok(consumer)
 }
 
 struct OwnedConsumerStream {
-    upstream:
-        OwningHandle<Arc<StreamConsumer>, Box<MessageStream<'static, DefaultConsumerContext>>>,
+    upstream: OwningHandle<
+        Arc<StreamConsumer>,
+        Box<Compat<MessageStream<'static, DefaultConsumerContext>>>,
+    >,
 }
 
 impl Stream for OwnedConsumerStream {
-    type Item = KafkaResult<BorrowedMessage<'static>>;
-    type Error = ();
+    type Item = BorrowedMessage<'static>;
+    type Error = KafkaError;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         self.upstream.poll()
@@ -146,7 +203,7 @@ impl Stream for OwnedConsumerStream {
 #[cfg(test)]
 mod test {
     use super::{kafka_source, KafkaSourceConfig};
-    use futures::sync::mpsc;
+    use futures01::sync::mpsc;
 
     fn make_config() -> KafkaSourceConfig {
         KafkaSourceConfig {
@@ -155,8 +212,11 @@ mod test {
             group_id: "group-id".to_string(),
             auto_offset_reset: "earliest".to_string(),
             session_timeout_ms: 10000,
-            host_key: None,
+            commit_interval_ms: 5000,
             key_field: Some("message_key".to_string()),
+            socket_timeout_ms: 60000,
+            fetch_wait_max_ms: 100,
+            ..Default::default()
         }
     }
 
@@ -184,7 +244,8 @@ mod integration_test {
         event,
         test_util::{collect_n, random_string, runtime},
     };
-    use futures::{sync::mpsc, Future};
+    use futures::compat::Compat;
+    use futures01::{sync::mpsc, Future};
     use rdkafka::{
         config::ClientConfig,
         producer::{FutureProducer, FutureRecord},
@@ -203,8 +264,7 @@ mod integration_test {
 
         let record = FutureRecord::to(topic).payload(text).key(key);
 
-        producer
-            .send(record, 0)
+        Compat::new(producer.send(record, 0))
             .map(|_| ())
             .map_err(|e| panic!("Cannot send event to Kafka: {:?}", e))
     }
@@ -222,8 +282,11 @@ mod integration_test {
             group_id: group_id.clone(),
             auto_offset_reset: "beginning".into(),
             session_timeout_ms: 6000,
-            host_key: None,
+            commit_interval_ms: 5000,
             key_field: Some("message_key".to_string()),
+            socket_timeout_ms: 60000,
+            fetch_wait_max_ms: 100,
+            ..Default::default()
         };
 
         let mut rt = runtime();
@@ -234,7 +297,10 @@ mod integration_test {
         let (tx, rx) = mpsc::channel(1);
         rt.spawn(kafka_source(config, tx).unwrap());
         let events = rt.block_on(collect_n(rx, 1)).ok().unwrap();
-        assert_eq!(events[0].as_log()[&event::MESSAGE], "my message".into());
+        assert_eq!(
+            events[0].as_log()[&event::log_schema().message_key()],
+            "my message".into()
+        );
         assert_eq!(
             events[0].as_log()[&Atom::from("message_key")],
             "my key".into()

@@ -1,6 +1,6 @@
 use super::CloudwatchError;
-use futures::{sync::oneshot, try_ready, Async, Future, Poll};
-use rusoto_core::RusotoFuture;
+use futures01::{sync::oneshot, try_ready, Async, Future, Poll};
+use rusoto_core::{RusotoError, RusotoFuture};
 use rusoto_logs::{
     CloudWatchLogs, CloudWatchLogsClient, CreateLogGroupError, CreateLogGroupRequest,
     CreateLogStreamError, CreateLogStreamRequest, DescribeLogStreamsError,
@@ -78,7 +78,10 @@ impl Future for CloudwatchFuture {
                         Ok(Async::Ready(res)) => res,
                         Ok(Async::NotReady) => return Ok(Async::NotReady),
                         Err(e) => {
-                            if let DescribeLogStreamsError::ResourceNotFound(_) = e {
+                            if let RusotoError::Service(
+                                DescribeLogStreamsError::ResourceNotFound(_),
+                            ) = e
+                            {
                                 if self.create_missing_group {
                                     info!("log group provided does not exist; creating a new one.");
 
@@ -99,7 +102,7 @@ impl Future for CloudwatchFuture {
                         .into_iter()
                         .next()
                     {
-                        trace!(message = "stream found", stream = ?stream.log_stream_name);
+                        debug!(message = "stream found", stream = ?stream.log_stream_name);
 
                         let events = self
                             .events
@@ -108,22 +111,20 @@ impl Future for CloudwatchFuture {
 
                         let token = stream.upload_sequence_token;
 
-                        trace!(message = "putting logs.", ?token);
+                        info!(message = "putting logs.", ?token);
                         self.state = State::Put(self.client.put_logs(token, events));
+                    } else if self.create_missing_stream {
+                        info!("provided stream does not exist; creating a new one.");
+                        self.state = State::CreateStream(self.client.create_log_stream());
                     } else {
-                        if self.create_missing_stream {
-                            debug!("provided stream does not exist; creating a new one.");
-                            self.state = State::CreateStream(self.client.create_log_stream());
-                        } else {
-                            return Err(CloudwatchError::NoStreamsFound);
-                        }
+                        return Err(CloudwatchError::NoStreamsFound);
                     }
                 }
 
                 State::CreateGroup(fut) => {
-                    let _ = try_ready!(fut.poll().map_err(CloudwatchError::CreateGroup));
+                    try_ready!(fut.poll().map_err(CloudwatchError::CreateGroup));
 
-                    trace!("group created.");
+                    info!(message = "group created.", name = %self.client.group_name);
 
                     // This does not abide by `create_missing_stream` since a group
                     // never has any streams and thus we need to create one if a group
@@ -132,9 +133,9 @@ impl Future for CloudwatchFuture {
                 }
 
                 State::CreateStream(fut) => {
-                    let _ = try_ready!(fut.poll().map_err(CloudwatchError::CreateStream));
+                    try_ready!(fut.poll().map_err(CloudwatchError::CreateStream));
 
-                    trace!("stream created.");
+                    info!(message = "stream created.", name = %self.client.stream_name);
 
                     self.state = State::DescribeStream(self.client.describe_stream());
                 }
@@ -144,7 +145,7 @@ impl Future for CloudwatchFuture {
 
                     let next_token = res.next_sequence_token;
 
-                    trace!(message = "putting logs was successful.", ?next_token);
+                    info!(message = "putting logs was successful.", ?next_token);
 
                     self.token_tx
                         .take()

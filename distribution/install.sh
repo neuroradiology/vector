@@ -18,7 +18,7 @@ _indent="   "
 
 header() {
     cat 1>&2 <<EOF
-                                   __   __  __  
+                                   __   __  __
                                    \ \ / / / /
                                     \ V / / /
                                      \_/  \/
@@ -29,8 +29,8 @@ header() {
 
 $_divider
 Website: https://vector.dev
-Docs: https://docs.vector.dev
-Community: https://vector.dev/community
+Docs: https://vector.dev/docs/
+Community: https://vector.dev/community/
 $_divider
 
 EOF
@@ -54,8 +54,6 @@ main() {
     downloader --check
     header
 
-    local _package_manager=$(get_package_manager)
-
     local prompt=yes
     for arg in "$@"; do
         case "$arg" in
@@ -73,63 +71,34 @@ main() {
 
     # Confirm with the user before proceeding to install Vector through a
     # package manager. Otherwise, we install from an archive.
-    if [ "$prompt" = "yes" ] && [ -n "$_package_manager" ]; then
-        echo "$_prompt How would you like to install vector?"
-        echo ""
-        echo "$_indent 1) Through the $_package_manager package manger (recommended)"
-        echo "$_indent 2) Directly from a pre-built archive"
+    if [ "$prompt" = "yes" ]; then
+        echo "$_prompt We'll be installing Vector via a pre-built archive at https://packages.timber.io/vector/latest/"
+        echo "$_prompt Ready to proceed? (y/n)"
         echo ""
 
         while true; do
             read -p "$_prompt " _choice </dev/tty
             case $_choice in
-                1)
-                    break
+                n)
+                    err "exiting"
                     ;;
-                2)
-                    _package_manager=""
+                y)
                     break
                     ;;
                 *)
-                    echo "Please enter 1 or 2."
+                    echo "Please enter y or n."
                     ;;
             esac
         done
-    fi
 
-    # Print a divider to separate the Vector installer output and the
-    # package manager installer output.
-    if [ -n "$_package_manager" ]; then
+        # Print a divider to separate the Vector installer output and the
+        # package manager installer output.
         echo ""
         echo "$_divider"
         echo ""
     fi
 
-    case "$_package_manager" in
-        apt)
-            apt-get install -y vector
-            ;;
-        yum)
-            yum install -y vector
-            ;;
-        homebrew)
-            brew tap timberio/brew
-            brew install vector
-            ;;
-        *)
-            install_from_archive
-            ;;
-    esac
-}
-
-get_package_manager() {
-    if check_cmd "apt-get"; then
-        echo "apt"
-    elif check_cmd "yum"; then
-        echo "yum"
-    elif check_cmd "brew"; then
-        echo "homebrew"
-    fi
+    install_from_archive
 }
 
 install_from_archive() {
@@ -138,6 +107,10 @@ install_from_archive() {
     need_cmd mkdir
     need_cmd rm
     need_cmd rmdir
+    need_cmd grep
+    need_cmd tar
+    need_cmd head
+    need_cmd sed
 
     get_architecture || return 1
     local _arch="$RETVAL"
@@ -151,32 +124,41 @@ install_from_archive() {
         x86_64-*linux*)
             _archive_arch="x86_64-unknown-linux-musl"
             ;;
+        armv7-*linux*hf)
+            _archive_arch="armv7-unknown-linux-musleabihf"
+            ;;
+        aarch64-*linux*)
+            _archive_arch="aarch64-unknown-linux-musl"
+            ;;
         *)
             err "unsupported arch: $_arch"
             ;;
     esac
 
-    local _url="${PACKAGE_ROOT}/latest/vector-latest-${_archive_arch}.tar.gz"
+    local _url="${PACKAGE_ROOT}/latest/vector-${_archive_arch}.tar.gz"
 
     local _dir
     _dir="$(mktemp -d 2>/dev/null || ensure mktemp -d -t vector-install)"
 
-    local _file="${_dir}/vector-latest-${_archive_arch}.tar.gz"
+    local _file="${_dir}/vector-${_archive_arch}.tar.gz"
 
     ensure mkdir -p "$_dir"
 
-    printf "$_prompt Downloading Vector..."
+    printf "$_prompt Downloading Vector via $_url"
     ensure downloader "$_url" "$_file"
     printf " ✓\n"
 
     printf "$_prompt Unpacking archive to $HOME/.vector ..."
     ensure mkdir -p "$HOME/.vector"
+    local _dir_name=$(tar -tzf ${_file} | head -1 | sed -e 's/\.\/\(.*\)\//\1/')
     ensure tar -xzf "$_file" --directory="$HOME/.vector" --strip-components=1
+
     printf " ✓\n"
 
     printf "$_prompt Adding Vector path to ~/.profile"
-    echo 'export PATH="$HOME/.vector/bin:$PATH"' >> $HOME/.profile
-    echo 'export PATH="$HOME/.vector/bin:$PATH"' >> $HOME/.zprofile
+    local _path="export PATH=\"\$HOME/.vector/${_dir_name}/bin:\$PATH\""
+    grep -qxF "${_path}" "${HOME}/.profile" || echo "${_path}" >> "${HOME}/.profile"
+    grep -qxF "${_path}" "${HOME}/.zprofile" || echo "${_path}" >> "${HOME}/.zprofile"
     printf " ✓\n"
 
     printf "$_prompt Install succeeded! 🚀\n"
@@ -184,7 +166,7 @@ install_from_archive() {
     printf "\n"
     printf "$_indent vector --config ~/.vector/vector.toml\n"
     printf "\n"
-    printf "$_prompt More information at https://docs.vector.dev\n"
+    printf "$_prompt More information at https://vector.dev/docs/\n"
 
     local _retval=$?
 
@@ -429,6 +411,14 @@ ensure() {
         echo ""
         echo "$output" >&2
         exit 1
+    fi
+}
+
+ensure_with_sudo() {
+    if ! [ -x "$(command -v sudo)" ]; then
+        ensure $@
+    else
+        ensure sudo $@
     fi
 }
 

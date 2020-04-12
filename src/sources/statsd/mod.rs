@@ -1,16 +1,16 @@
-use crate::{topology::config::GlobalOptions, Event};
-use futures::{future, sync::mpsc, Future, Sink, Stream};
+use crate::{shutdown::ShutdownSignal, topology::config::GlobalOptions, Event};
+use futures01::{future, sync::mpsc, Future, Sink, Stream};
 use parser::parse;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use tokio::{
+use tokio01::{
     self,
     codec::BytesCodec,
     net::{UdpFramed, UdpSocket},
 };
 use tracing::field;
 
-mod parser;
+pub mod parser;
 
 #[derive(Deserialize, Serialize, Debug)]
 struct StatsdConfig {
@@ -23,13 +23,18 @@ impl crate::topology::config::SourceConfig for StatsdConfig {
         &self,
         _name: &str,
         _globals: &GlobalOptions,
+        _shutdown: ShutdownSignal,
         out: mpsc::Sender<Event>,
-    ) -> Result<super::Source, String> {
+    ) -> crate::Result<super::Source> {
         Ok(statsd(self.address, out))
     }
 
     fn output_type(&self) -> crate::topology::config::DataType {
         crate::topology::config::DataType::Metric
+    }
+
+    fn source_type(&self) -> &'static str {
+        "statsd"
     }
 }
 
@@ -58,7 +63,7 @@ fn statsd(addr: SocketAddr, out: mpsc::Sender<Event>) -> super::Source {
                         .filter_map(|res| res.map_err(|e| error!("{}", e)).ok())
                         .map(Event::Metric)
                         .collect::<Vec<_>>();
-                    futures::stream::iter_ok::<_, std::io::Error>(metrics)
+                    futures01::stream::iter_ok::<_, std::io::Error>(metrics)
                 })
                 .flatten()
                 .map_err(|e| error!("error reading datagram: {:?}", e));
@@ -68,6 +73,7 @@ fn statsd(addr: SocketAddr, out: mpsc::Sender<Event>) -> super::Source {
     )
 }
 
+#[cfg(feature = "sinks-prometheus")]
 #[cfg(test)]
 mod test {
     use super::StatsdConfig;
@@ -76,7 +82,7 @@ mod test {
         test_util::{block_on, next_addr, runtime, shutdown_on_idle},
         topology::{self, config},
     };
-    use futures::Stream;
+    use futures01::Stream;
     use std::{thread, time::Duration};
 
     fn parse_count(lines: &Vec<&str>, prefix: &str) -> usize {
@@ -103,7 +109,7 @@ mod test {
                 address: out_addr,
                 namespace: "vector".into(),
                 buckets: vec![1.0, 2.0, 4.0],
-                flush_period: Duration::from_millis(100),
+                flush_period_secs: 1,
             },
         );
 
@@ -122,11 +128,11 @@ mod test {
                 )
                 .unwrap();
             // Space things out slightly to try to avoid dropped packets
-            thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(10));
         }
 
         // Give packets some time to flow through
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(100));
 
         let client = hyper::Client::new();
         let response =
@@ -172,7 +178,7 @@ mod test {
         // Flush test
         {
             // Wait for flush to happen
-            thread::sleep(Duration::from_millis(200));
+            thread::sleep(Duration::from_millis(2000));
 
             let response =
                 block_on(client.get(format!("http://{}/metrics", out_addr).parse().unwrap()))
@@ -192,9 +198,9 @@ mod test {
 
             socket.send_to(b"set:0|s\nset:1|s\n", &in_addr).unwrap();
             // Space things out slightly to try to avoid dropped packets
-            thread::sleep(Duration::from_millis(1));
-            // Give packets some time to flow through
             thread::sleep(Duration::from_millis(10));
+            // Give packets some time to flow through
+            thread::sleep(Duration::from_millis(100));
 
             let response =
                 block_on(client.get(format!("http://{}/metrics", out_addr).parse().unwrap()))

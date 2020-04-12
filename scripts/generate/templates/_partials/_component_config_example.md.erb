@@ -1,17 +1,26 @@
-{% code-tabs %}
-{% code-tabs-item title="vector.toml (example)" %}
-```toml
-<%= config_example(component.options.to_h.values.sort, path: "#{component.type.pluralize}.my_#{component.type}_id") %>
+<%- if groups.length > 1 -%>
+<Tabs
+  block={true}
+  defaultValue="<%= groups.first.label.parameterize %>"
+  values={<%= groups.collect { |group| {label: group.label, value: group.label.parameterize} }.to_json %>}>
+<%- end -%>
+<%- groups.each do |group| -%>
+<%- if groups.length > 1 -%>
+<TabItem value="<%= group.label.parameterize %>">
+
+<%- end -%>
+```toml title="vector.toml"
+<%=
+  config_example(component.options_list, group: group.group_name, table_path: [component.type.pluralize, "my_#{component.type}_id"]) do |option|
+    group.option_filter.call(option)
+  end
+%>
 ```
-{% endcode-tabs-item %}
-{% code-tabs-item title="vector.toml (schema)" %}
-```toml
-<%= config_schema(component.options.to_h.values.sort, path: "#{component.type.pluralize}.<#{component.type}-id>") %>
-```
-{% endcode-tabs-item %}
-{% code-tabs-item title="vector.toml (specification)" %}
-```toml
-<%= config_spec(component.options.to_h.values.sort, path: "#{component.type.pluralize}.#{component.id}") %>
-```
-{% endcode-tabs-item %}
-{% endcode-tabs %}
+<%- if groups.length > 1 -%>
+
+</TabItem>
+<%- end -%>
+<%- end -%>
+<%- if groups.length > 1 -%>
+</Tabs>
+<%- end -%>

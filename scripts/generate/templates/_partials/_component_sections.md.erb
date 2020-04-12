@@ -1,31 +1,40 @@
-<%- if component.sink? && component.service_provider == "AWS" -%>
-### Authentication
+<%- if component.sink? && component.service_provider?("AWS") -%>
+### AWS Authentication
 
 Vector checks for AWS credentials in the following order:
 
 1. Environment variables `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
-2. The [`credential_process` command][url.aws_credential_process] in the AWS config file. (usually located at `~/.aws/config`)
-3. The [AWS credentials file][url.aws_credentials_file]. (usually located at `~/.aws/credentials`)
-4. The [IAM instance profile][url.iam_instance_profile]. (will only work if running on an EC2 instance with an instance profile/role)
+2. The [`credential_process` command][urls.aws_credential_process] in the AWS config file. (usually located at `~/.aws/config`)
+3. The [AWS credentials file][urls.aws_credentials_file]. (usually located at `~/.aws/credentials`)
+4. The [IAM instance profile][urls.iam_instance_profile]. (will only work if running on an EC2 instance with an instance profile/role)
 
 If credentials are not found the [healtcheck](#healthchecks) will fail and an
-error will be [logged][docs.monitoring_logs].
+error will be [logged][docs.monitoring#logs].
 
 #### Obtaining an access key
 
 In general, we recommend using instance profiles/roles whenever possible. In
 cases where this is not possible you can generate an AWS access key for any user
-within your AWS account. AWS provides a [detailed guide][url.aws_access_keys] on
+within your AWS account. AWS provides a [detailed guide][urls.aws_access_keys] on
 how to do this.
+<%- if component.options.respond_to?(:assume_role) -%>
+
+#### Assuming Roles
+
+Vector can assume an AWS IAM role via the `assume_role` option. This is an
+optional setting that is helpful for a variety of use cases, such as cross
+account access.
 <%- end -%>
-<%- if component.sink? && component.buffer? && component.batching? -%>
+<%- end -%>
+<%- if component.options.respond_to?(:buffer) -%>
+<%- if component.options.respond_to?(:batch) -%>
 
 ### Buffers & Batches
 
-<%- if component.partition_options.any? -%> 
-![][images.sink-flow-partitioned]
+<%- if component.partition_options.any? -%>
+<SVG src="/img/buffers-and-batches-partitioned.svg" />
 <%- else -%>
-![][images.sink-flow-serial]
+<SVG src="/img/buffers-and-batches-serial.svg" />
 <%- end -%>
 
 The `<%= component.name %>` <%= component.type %> buffers & batches data as
@@ -34,48 +43,53 @@ differently, instead of treating them as global concepts, Vector treats them
 as sink specific concepts. This isolates sinks, ensuring services disruptions
 are contained and [delivery guarantees][docs.guarantees] are honored.
 
-#### Buffers types
+*Batches* are flushed when 1 of 2 conditions are met:
 
-The `buffer.type` option allows you to control buffer resource usage:
+1. The batch age meets or exceeds the configured `timeout_secs`.
+2. The batch size meets or exceeds the configured <% if component.options.batch.children.respond_to?(:max_size) %>`max_size`<% else %>`max_events`<% end %>.
 
-| Type     | Description                                                                                                    |
-|:---------|:---------------------------------------------------------------------------------------------------------------|
-| `memory` | Pros: Fast. Cons: Not persisted across restarts. Possible data loss in the event of a crash. Uses more memory. |
-| `disk`   | Pros: Persisted across restarts, durable. Uses much less memory. Cons: Slower, see below.                      |
+*Buffers* are controlled via the [`buffer.*`](#buffer) options.
+<%- else -%>
 
-#### Buffer overflow
+### Buffers
 
-The `buffer.when_full` option allows you to control the behavior when the
-buffer overflows:
+<SVG src="/img/buffers.svg" />
 
-| Type          | Description                                                                                                                        |
-|:--------------|:-----------------------------------------------------------------------------------------------------------------------------------|
-| `block`       | Applies back pressure until the buffer makes room. This will help to prevent data loss but will cause data to pile up on the edge. |
-| `drop_newest` | Drops new data as it's received. This data is lost. This should be used when performance is the highest priority.                  |
-
-#### Batch flushing
-
-Batches are flushed when 1 of 2 conditions are met:
-
-1. The batch age meets or exceeds the configured `batch_timeout` (default: `<%= component.options.batch_timeout.human_default %>`).
-2. The batch size meets or exceeds the configured `batch_size` (default: `<%= component.options.batch_size.human_default %>`).
-<%- end -%>
-<%- if component.options.compression -%>
-
-### Compression
-
-The `<%= component.name %>` <%= component.type %> compresses payloads before
-flushing. This helps to reduce the payload size, ultimately reducing bandwidth
-and cost. This is controlled via the `compression` option. Each compression
-type is described in more detail below:
-
-| Compression | Description |
-|:------------|:------------|
-<%- component.options.compression.enum.each do |compression| -%>
-| `<%= compression %>` | <%= compression_description(compression) %> |
+The `<%= component.name %>` <%= component.type %> buffers events as shown in
+the diagram above. This helps to smooth out data processing if the downstream
+service applies backpressure. Buffers are controlled via the
+[`buffer.*`](#buffer) options.
 <%- end -%>
 <%- end -%>
-<% if component.context_options.any? -%>
+<%- if component.transform? && component.function_category != "program" -%>
+
+### Complex Processing
+
+If you encounter limitations with the `<%= component.name %>`
+<%= component.type %> then we recommend using a [runtime transform][urls.vector_programmable_transforms].
+These transforms are designed for complex processing and give you the power of
+full programming runtime.
+<%- end -%>
+<%- if component.requirements.docker_api -%>
+
+### Connecting To The Docker Daemon
+
+Vector will automatically attempt to connect to the docker daemon for you. If
+the user that Vector is running under can run `docker ps` then Vector will be
+able to connect. Vector will also respect if `DOCKER_HOST` and
+`DOCKER_VERIFY_TLS` are set (as well as other Docker environment variables).
+See the [Docker daemon docs][urls.docker_daemon_socket_option].
+<%- end -%>
+<%- if component.requirements.kubernetes -%>
+
+### Connecting To The Kubernetes API server
+
+Vector will automatically attempt to connect to the [Kubernetes API
+server][urls.kubernetes_api_server] for you. If Vector is running in a
+Kubernetes cluster then Vector will connect to that cluster using the
+[Kubernetes provided access information][urls.kubernetes_accessing_api_from_pod].
+<%- end -%>
+<%- if component.context_options.any? -%>
 
 ### Context
 
@@ -83,47 +97,17 @@ By default, the `<%= component.name %>` <%= component.type %> will add context
 keys to your events via the <%= option_names(component.context_options).to_sentence %>
 options.
 <%- end -%>
-<% if component.respond_to?(:delivery_guarantee) -%>
+<%- if component.requirements.docker_api -%>
 
-### Delivery Guarantee
+### Docker Logging Drivers
 
-<% case component.delivery_guarantee -%>
-<% when "at_least_once" -%>
-This component offers an [**at least once** delivery guarantee][docs.at_least_once_delivery]
-if your [pipeline is configured to achieve this][docs.at_least_once_delivery].
-<% when "best_effort" -%>
-Due to the nature of this component, it offers a
-[**best effort** delivery guarantee][docs.best_effort_delivery].
-<% end -%>
-<% end -%>
-<% if component.options.encoding -%>
-
-### Encodings
-
-The `<%= component.name %>` <%= component.type %> encodes events before writing
-them downstream. This is controlled via the `encoding` option which accepts
-the following options:
-
-| Encoding | Description |
-| :------- | :---------- |
-<%- component.options.encoding.enum.each do |encoding| -%>
-| `<%= encoding %>` | <%= encoding_description(encoding) %> |
-<%- end -%>
-<%- if component.options.encoding.default.nil? -%>
-
-#### Dynamic encoding
-
-By default, the `encoding` chosen is dynamic based on the explicit/implcit
-nature of the event's structure. For example, if this event is parsed (explicit
-structuring), Vector will use `json` to encode the structured data. If the event
-was not explicitly structured, the `text` encoding will be used.
-
-To further explain why Vector adopts this default, take the simple example of
-accepting data over the [`tcp` source][docs.tcp_source] and then connecting
-it directly to the `<%= component.name %>` <%= component.type %>. It is less
-surprising that the outgoing data reflects the incoming data exactly since it
-was not explicitly structured.
-<%- end -%>
+In order for the Vector `docker` source to work properly, you must configure
+the [`json-file`][urls.docker_logging_driver_json_file] (default) or
+[`journald`][urls.docker_logging_driver_journald] Docker logging drivers.
+This is a requirement of the [Docker daemon][urls.docker_daemon], which Vector
+uses to integrate. See the
+[Docker Integration Strategy section](#docker-integration-strategy) for more
+info.
 <%- end -%>
 
 ### Environment Variables
@@ -132,8 +116,8 @@ Environment variables are supported through all of Vector's configuration.
 Simply add `${MY_ENV_VAR}` in your Vector configuration file and the variable
 will be replaced before being evaluated.
 
-You can learn more in the [Environment Variables][docs.configuration.environment-variables]
-section.
+You can learn more in the
+[Environment Variables][docs.configuration#environment-variables] section.
 <%- if component.sink? && component.exposing? -%>
 
 ### Exposing & Scraping
@@ -143,27 +127,84 @@ The `address` option determines the address and port the data is made available
 on. You'll need to configure your networking so that the configured port is
 accessible by the downstream service doing the scraping.
 <%- end -%>
-<% if component.sink? && component.healthcheck? -%>
+<%- if component.field_path_notation_options.any? -%>
+
+### Field Notation Syntax
+
+The <%= option_names(component.field_path_notation_options).to_sentence %> options
+support [Vector's field notiation syntax][docs.reference.field-path-notation],
+enabling access to root-level, nested, and array field values. For example:
+
+```toml title="vector.toml"
+[<%= component.type.pluralize %>.my_<%= component.id %>_id]
+  # ...
+  <%- option = component.field_path_notation_options.fetch(0) -%>
+  <%- option.examples.each do |example| -%>
+  <%= option.name %> = <%= example.to_toml %>
+  <%- end -%>
+  # ...
+```
+
+You can learn more about Vector's field notation in the
+[field notation reference][docs.reference.field-path-notation].
+<%- end -%>
+<%- if component.sink? && component.service_provider?("Google") -%>
+
+### GCP Authentication
+
+GCP offers a [variety of authentication methods][urls.gcp_authentication] and
+Vector is concerned with the [server to server methods][urls.gcp_authentication_server_to_server]
+and will find credentials in the following order:
+
+1. If the `credentials_path` option is set.
+2. If the `api_key` option is set.
+3. Finally, if the `GOOGLE_APPLICATION_CREDENTIALS` envrionment variable is set.
+
+If credentials are not found the [healtcheck](#healthchecks) will fail and an
+error will be [logged][docs.monitoring#logs].
+
+<%- end -%>
+<%- if component.sink? && component.healthcheck? -%>
 
 ### Health Checks
 
 Health checks ensure that the downstream service is accessible and ready to
 accept data. This check is performed upon sink initialization.
-<%- if component.options.healthcheck_uri -%>
+<%- if component.options.respond_to?(:healthcheck_uri) -%>
 In order to run this check you must provide a value for the `healthcheck_uri`
 option.
 <%- end -%>
-
 If the health check fails an error will be logged and Vector will proceed to
-start. If you'd like to exit immediately upon health check failure, you can
+start.
+
+#### Require Health Checks
+
+If you'd like to exit immediately upon a health check failure, you can
 pass the `--require-healthy` flag:
 
 ```bash
 vector --config /etc/vector/vector.toml --require-healthy
 ```
 
-And finally, if you'd like to disable health checks entirely for this sink
-you can set the `healthcheck` option to `false`.
+#### Disable Health Checks
+
+If you'd like to disable health checks for this sink you can set the
+`healthcheck` option to `false`.
+<%- end -%>
+<%- if component.requirements.kubernetes_rbac -%>
+
+### Kubernetes RBAC
+
+Kubernetes [RBAC][urls.kubernetes_rbac] must be enabled for this component to
+work. This can be achieved by passing the appropriate flags when starting
+the [Kubernetes API server][urls.kubernetes_api_server]:
+
+```bash
+kube-apiserver --authorization-mode=RBAC ...
+```
+
+For specific permissions, please see the ["Permissions"
+section][<%= component_short_link(component) %>#permissions].
 <%- end -%>
 <%- if component.partition_options.any? -%>
 
@@ -172,32 +213,51 @@ you can set the `healthcheck` option to `false`.
 Partitioning is controlled via the <%= option_names(component.partition_options).to_sentence %>
 options and allows you to dynamically partition data on the fly.
 <%- if component.partition_options.any?(&:templateable?) -%>
-You'll notice that Vector's [template sytax](#template-syntax) is supported
-for these options, enabling you to use field values as the partition's key.
+You'll notice that Vector's [template sytax][docs.reference.templating] is
+supported for these options, enabling you to use field values as partition keys.
 <%- end -%>
 <%- end -%>
-<%- if component.options.rate_limit_duration -%>
+<%- if component.requirements.aws_imds_v2 -%>
+
+### AWS IMDS v2
+
+v2 of the [AWS IMDS service][urls.aws_ec2_instance_metadata] addresses [a number
+of very serious security issues][urls.aws_imds_v1_security_problems] with v1.
+As part of tighening security, Amazon limited the number of network hops allowed
+to communicate with this service to 1. Unfortunately, when running Vector within
+Docker this introduces an additional hop. Therefore, you _must_ configure your
+AWS instances to allow for 2 hops:
+
+```bash
+aws ec2 modify-instance-metadata-options --instance-id <ID> --http-endpoint enabled --http-put-response-hop-limit 2
+```
+
+If you do not raise this limit the `aws_ec2_metadata` transform will not work.
+<%- end -%>
+<%- if component.options.respond_to?(:request) -%>
 
 ### Rate Limits
 
 Vector offers a few levers to control the rate and volume of requests to the
-downstream service. Start with the `rate_limit_duration` and `rate_limit_num`
-options to ensure Vector does not exceed the specified number of requests in
-the specified window. You can further control the pace at which this window is
-saturated with the `request_in_flight_limit` option, which will guarantee no
-more than the specified number of requests are in-flight at any given time.
+downstream service. Start with the `rate_limit_duration_secs` and
+`rate_limit_num` options to ensure Vector does not exceed the specified
+number of requests in the specified window. You can further control the pace at
+which this window is saturated with the `in_flight_limit` option, which
+will guarantee no more than the specified number of requests are in-flight at
+any given time.
 
 Please note, Vector's defaults are carefully chosen and it should be rare that
 you need to adjust these. If you found a good reason to do so please share it
-with the Vector team by [opening an issie][url.new_<%= component.id %>_issue].
+with the Vector team by [opening an issue][urls.new_<%= component.id %>_issue].
 <%- end -%>
-<%- if component.options.retry_attempts -%>
+<%- if component.options.respond_to?(:request) -%>
 
 ### Retry Policy
 
 Vector will retry failed requests (status == `429`, >= `500`, and != `501`).
 Other responses will _not_ be retried. You can control the number of retry
-attempts and backoff rate with the `retry_attempts` and `retry_backoff_secs` options.
+attempts and backoff rate with the `retry_attempts` and
+`retry_backoff_secs` options.
 <%- end -%>
 <%- if component.sink? && component.streaming? -%>
 
@@ -211,14 +271,12 @@ event-by-event basis. It does not batch data.
 ### Template Syntax
 
 The <%= option_names(component.templateable_options).to_sentence %> options
-support [Vector's template syntax][docs.configuration.template-syntax],
-enabling dynamic values derived from the event's data. This syntax accepts
-[strftime specifiers][url.strftime_specifiers] as well as the
+support [Vector's template syntax][docs.reference.templating], enabling dynamic
+values derived from the event's data. This syntax accepts
+[strptime specifiers][urls.strptime_specifiers] as well as the
 `{{ field_name }}` syntax for accessing event fields. For example:
 
-{% code-tabs %}
-{% code-tabs-item title="vector.toml" %}
-```toml
+```toml title="vector.toml"
 [<%= component.type.pluralize %>.my_<%= component.id %>_id]
   # ...
   <%- option = component.templateable_options.fetch(0) -%>
@@ -227,54 +285,58 @@ enabling dynamic values derived from the event's data. This syntax accepts
   <%- end -%>
   # ...
 ```
-{% endcode-tabs-item %}
-{% endcode-tabs %}
 
-You can read more about the complete syntax in the
-[template syntax section][docs.configuration.template-syntax].
+You can learn more about the complete syntax in the
+[templating reference][docs.reference.templating].
 <%- end -%>
-<%- if component.options.request_timeout_secs -%>
+<%- if component.options.key?("tls") -%>
 
-### Timeouts
+### TLS
 
-To ensure the pipeline does not halt when a service fails to respond Vector
-will abort requests after `<%= component.options.request_timeout_secs.human_default %>`.
-This can be adjsuted with the `request_timeout_secs` option.
-
-It is highly recommended that you do not lower value below the service's
-internal timeout, as this could create orphaned requests, pile on retries,
-and result in deuplicate data downstream.
+Vector uses [Openssl][urls.openssl] for TLS protocols for it's battle-tested
+and reliable security. You can enable and adjust TLS behavior via the `tls.*`
+options.
 <%- end -%>
-<%- if component.options.types && component.options.types.table? -%>
+<%- if component.options.key?("types") -%>
 
-### Types
+### Value Coercion
 
-By default, extracted (parsed) fields all contain `string` values. You can
-coerce these values into types via the `types` table as shown in the
-[Config File](#config-file) example above. For example:
+Values can be coerced upon extraction via the `types.*` options. This functions
+exactly like the [`coercer` transform][docs.transforms.coercer] except that its
+coupled within this transform for convenience.
 
-```toml
-[transforms.my_transform_id]
-  # ...
+#### Timestamps
 
-  # OPTIONAL - Types
-  [transforms.my_transform_id.types]
-    status = "int"
-    duration = "float"
-    success = "bool"
-    timestamp = "timestamp|%s"
-    timestamp = "timestamp|%+"
-    timestamp = "timestamp|%F"
-    timestamp = "timestamp|%a %b %e %T %Y"
+You can coerce values into timestamps via the `timestamp` type:
+
+```toml title="vector.toml"
+# ...
+types.first_timestamp = "timestamp" # best effort parsing
+types.second_timestamp = "timestamp|%Y-%m-%dT%H:%M:%S%z" # ISO8601
+# ...
 ```
 
-The available types are:
+As noted above, if you do not specify a specific `strftime` format, Vector
+will make a best effort attempt to parse the timestamp against the following
+common formats:
 
-| Type        | Desription                                                                                                          |
-|:------------|:--------------------------------------------------------------------------------------------------------------------|
-| `bool`      | Coerces to a `true`/`false` boolean. The `1`/`0` and `t`/`f` values are also coerced.                               |
-| `float`     | Coerce to 64 bit floats.                                                                                            |
-| `int`       | Coerce to a 64 bit integer.                                                                                         |
-| `string`    | Coerces to a string. Generally not necessary since values are extracted as strings.                                 |
-| `timestamp` | Coerces to a Vector timestamp. [`strftime` specificiers][url.strftime_specifiers] must be used to parse the string. |
-<% end -%>
+| Format               | Description                                  |
+|:---------------------|:---------------------------------------------|
+| **Without Timezone** |                                              |
+| `%F %T`              | YYYY-MM-DD HH:MM:SS                          |
+| `%v %T`              | DD-Mmm-YYYY HH:MM:SS                         |
+| `FT%T`               | ISO 8601 / RFC 3339 without TZ               |
+| `m/%d/%Y:%T`         | US common date format                        |
+| `a, %d %b %Y %T`     | RFC 822/2822 without TZ                      |
+| `a %d %b %T %Y`      | `date` command output without TZ             |
+| `A %d %B %T %Y`      | `date` command output without TZ, long names |
+| `a %b %e %T %Y`      | ctime format                                 |
+| **With Timezone**    |                                              |
+| `%+`                 | ISO 8601 / RFC 3339                          |
+| `%a %d %b %T %Z %Y`  | `date` command output                        |
+| `%a %d %b %T %z %Y`  | `date` command output, numeric TZ            |
+| `%a %d %b %T %#z %Y` | `date` command output, numeric TZ            |
+| **UTC Formats**      |                                              |
+| `%s`                 | UNIX timestamp                               |
+| `%FT%TZ`             | ISO 8601 / RFC 3339 UTC                      |
+<%- end -%>

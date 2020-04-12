@@ -1,15 +1,17 @@
 use crate::{file_watcher::FileWatcher, FileFingerprint, FilePosition};
 use bytes::Bytes;
-use futures::{stream, Future, Sink, Stream};
+use futures::{executor::block_on, stream, stream::StreamExt, Sink};
 use glob::{glob, Pattern};
-use std::collections::HashMap;
-use std::fs;
+use indexmap::IndexMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, Write};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time;
 use tracing::field;
+
+use crate::metadata_ext::PortableFileExt;
 
 /// `FileServer` is a Source which cooperatively schedules reads over files,
 /// converting the lines of said files into `LogLine` structures. As
@@ -30,6 +32,7 @@ pub struct FileServer {
     pub data_dir: PathBuf,
     pub glob_minimum_cooldown: time::Duration,
     pub fingerprinter: Fingerprinter,
+    pub oldest_first: bool,
 }
 
 /// `FileServer` as Source
@@ -48,20 +51,66 @@ pub struct FileServer {
 impl FileServer {
     pub fn run(
         self,
-        mut chans: impl Sink<SinkItem = (Bytes, String), SinkError = ()>,
+        mut chans: impl Sink<(Bytes, String), Error = ()> + Unpin,
         shutdown: std::sync::mpsc::Receiver<()>,
     ) {
-        let mut read_from_beginning = self.start_at_beginning;
         let mut line_buffer = Vec::new();
         let mut fingerprint_buffer = Vec::new();
 
-        let mut fp_map: HashMap<FileFingerprint, FileWatcher> = Default::default();
+        let mut fp_map: IndexMap<FileFingerprint, FileWatcher> = Default::default();
 
         let mut backoff_cap: usize = 1;
         let mut lines = Vec::new();
 
         let mut checkpointer = Checkpointer::new(&self.data_dir);
         checkpointer.read_checkpoints(self.ignore_before);
+
+        let exclude_patterns = self
+            .exclude
+            .iter()
+            .map(|e| Pattern::new(e.to_str().expect("no ability to glob")).unwrap())
+            .collect::<Vec<_>>();
+
+        let mut known_small_files = HashSet::new();
+
+        let mut existing_files = Vec::new();
+        for include_pattern in &self.include {
+            for path in glob(include_pattern.to_str().expect("no ability to glob"))
+                .expect("Failed to read glob pattern")
+                .filter_map(Result::ok)
+            {
+                if exclude_patterns
+                    .iter()
+                    .any(|e| e.matches(path.to_str().unwrap()))
+                {
+                    continue;
+                }
+
+                if let Some(file_id) = self.fingerprinter.get_fingerprint_or_log_error(
+                    &path,
+                    &mut fingerprint_buffer,
+                    &mut known_small_files,
+                ) {
+                    existing_files.push((path, file_id));
+                }
+            }
+        }
+
+        existing_files.sort_by_key(|(path, _file_id)| {
+            fs::metadata(&path)
+                .and_then(|m| m.created())
+                .unwrap_or_else(|_| time::SystemTime::now())
+        });
+
+        for (path, file_id) in existing_files {
+            self.watch_new_file(
+                path,
+                file_id,
+                &mut fp_map,
+                &checkpointer,
+                self.start_at_beginning,
+            );
+        }
 
         // Alright friends, how does this work?
         //
@@ -87,11 +136,6 @@ impl FileServer {
                     .ok();
 
                 // Search (glob) for files to detect major file changes.
-                let exclude_patterns = self
-                    .exclude
-                    .iter()
-                    .map(|e| Pattern::new(e.to_str().expect("no ability to glob")).unwrap())
-                    .collect::<Vec<_>>();
                 for (_file_id, watcher) in &mut fp_map {
                     watcher.set_file_findable(false); // assume not findable until found
                 }
@@ -107,10 +151,11 @@ impl FileServer {
                             continue;
                         }
 
-                        if let Ok(file_id) = self
-                            .fingerprinter
-                            .get_fingerprint_of_file(&path, &mut fingerprint_buffer)
-                        {
+                        if let Some(file_id) = self.fingerprinter.get_fingerprint_or_log_error(
+                            &path,
+                            &mut fingerprint_buffer,
+                            &mut known_small_files,
+                        ) {
                             if let Some(watcher) = fp_map.get_mut(&file_id) {
                                 // file fingerprint matches a watched file
                                 let was_found_this_cycle = watcher.file_findable();
@@ -153,33 +198,27 @@ impl FileServer {
                                 }
                             } else {
                                 // untracked file fingerprint
-                                let file_position = if read_from_beginning {
-                                    0
-                                } else {
-                                    checkpointer.get_checkpoint(file_id).unwrap_or(0)
-                                };
-                                if let Ok(mut watcher) =
-                                    FileWatcher::new(path, file_position, self.ignore_before)
-                                {
-                                    info!(
-                                        message = "Found file to watch.",
-                                        path = field::debug(&watcher.path),
-                                        file_position = field::debug(&file_position),
-                                    );
-                                    watcher.set_file_findable(true);
-                                    fp_map.insert(file_id, watcher);
-                                };
+                                self.watch_new_file(
+                                    path,
+                                    file_id,
+                                    &mut fp_map,
+                                    &checkpointer,
+                                    false,
+                                );
                             }
                         }
                     }
                 }
-                // This special flag only applies to first iteration on startup.
-                read_from_beginning = false;
             }
 
             // Collect lines by polling files.
             let mut global_bytes_read: usize = 0;
+            let mut maxed_out_reading_single_file = false;
             for (&file_id, watcher) in &mut fp_map {
+                if !watcher.should_read() {
+                    continue;
+                }
+
                 let mut bytes_read: usize = 0;
                 while let Ok(sz) = watcher.read_line(&mut line_buffer, self.max_line_bytes) {
                     if sz > 0 {
@@ -202,6 +241,7 @@ impl FileServer {
                         break;
                     }
                     if bytes_read > self.max_read_bytes {
+                        maxed_out_reading_single_file = true;
                         break;
                     }
                 }
@@ -209,22 +249,23 @@ impl FileServer {
                     global_bytes_read = global_bytes_read.saturating_add(bytes_read);
                     checkpointer.set_checkpoint(file_id, watcher.get_file_position());
                 }
+                // Do not move on to newer files if we are behind on an older file
+                if self.oldest_first && maxed_out_reading_single_file {
+                    break;
+                }
             }
 
             // A FileWatcher is dead when the underlying file has disappeared.
             // If the FileWatcher is dead we don't retain it; it will be deallocated.
             fp_map.retain(|_file_id, watcher| !watcher.dead());
 
-            match stream::iter_ok::<_, ()>(lines.drain(..))
-                .forward(chans)
-                .wait()
-            {
-                Ok((_, sink)) => chans = sink,
-                Err(_) => {
-                    debug!("Output channel closed.");
-                    return;
-                }
+            let stream = stream::iter(lines.drain(..).map(Result::<_, ()>::Ok));
+            let result = block_on(stream.forward(&mut chans));
+            if result.is_err() {
+                debug!("Output channel closed.");
+                return;
             }
+
             // When no lines have been read we kick the backup_cap up by twice,
             // limited by the hard-coded cap. Else, we set the backup_cap to its
             // minimum on the assumption that next time through there will be
@@ -248,6 +289,33 @@ impl FileServer {
             }
         }
     }
+
+    fn watch_new_file(
+        &self,
+        path: PathBuf,
+        file_id: FileFingerprint,
+        fp_map: &mut IndexMap<FileFingerprint, FileWatcher>,
+        checkpointer: &Checkpointer,
+        read_from_beginning: bool,
+    ) {
+        let file_position = if read_from_beginning {
+            0
+        } else {
+            checkpointer.get_checkpoint(file_id).unwrap_or(0)
+        };
+        match FileWatcher::new(path.clone(), file_position, self.ignore_before) {
+            Ok(mut watcher) => {
+                info!(
+                    message = "Found file to watch.",
+                    path = field::debug(&watcher.path),
+                    file_position = field::debug(&file_position),
+                );
+                watcher.set_file_findable(true);
+                fp_map.insert(file_id, watcher);
+            }
+            Err(e) => error!(message = "Error watching new file", %e, file = ?path),
+        };
+    }
 }
 
 pub struct Checkpointer {
@@ -261,8 +329,8 @@ impl Checkpointer {
         let directory = data_dir.join("checkpoints");
         let glob_string = directory.join("*").to_string_lossy().into_owned();
         Checkpointer {
-            directory: directory,
-            glob_string: glob_string,
+            directory,
+            glob_string,
             checkpoints: HashMap::new(),
         }
     }
@@ -325,9 +393,9 @@ impl Fingerprinter {
     ) -> Result<FileFingerprint, io::Error> {
         match *self {
             Fingerprinter::DevInode => {
-                let metadata = fs::metadata(path)?;
-                let dev = metadata.dev();
-                let ino = metadata.ino();
+                let file_handle = File::open(path)?;
+                let dev = file_handle.portable_dev()?;
+                let ino = file_handle.portable_ino()?;
                 buffer.clear();
                 buffer.write_all(&dev.to_be_bytes())?;
                 buffer.write_all(&ino.to_be_bytes())?;
@@ -346,6 +414,26 @@ impl Fingerprinter {
         }
         let fingerprint = crc::crc64::checksum_ecma(&buffer[..]);
         Ok(fingerprint)
+    }
+
+    fn get_fingerprint_or_log_error(
+        &self,
+        path: &PathBuf,
+        buffer: &mut Vec<u8>,
+        known_small_files: &mut HashSet<PathBuf>,
+    ) -> Option<FileFingerprint> {
+        self.get_fingerprint_of_file(path, buffer)
+            .map_err(|err| {
+                if err.kind() == io::ErrorKind::UnexpectedEof {
+                    if !known_small_files.contains(path) {
+                        warn!(message = "Ignoring file smaller than fingerprint_bytes", file = ?path);
+                        known_small_files.insert(path.clone());
+                    }
+                } else {
+                    error!(message = "Error reading file for fingerprinting", %err, file = ?path);
+                }
+            })
+            .ok()
     }
 }
 

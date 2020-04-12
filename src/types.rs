@@ -1,10 +1,16 @@
-use crate::event::ValueKind;
+use crate::event::Value;
 use chrono::{DateTime, Local, ParseError as ChronoParseError, TimeZone, Utc};
+use lazy_static::lazy_static;
 use snafu::{ResultExt, Snafu};
 use std::collections::{HashMap, HashSet};
 use std::num::{ParseFloatError, ParseIntError};
+use std::path::PathBuf;
 use std::str::FromStr;
 use string_cache::DefaultAtom as Atom;
+
+lazy_static! {
+    pub static ref DEFAULT_CONFIG_PATHS: Vec<PathBuf> = vec!["/etc/vector/vector.toml".into()];
+}
 
 #[derive(Debug, Snafu)]
 pub enum ConversionError {
@@ -13,8 +19,8 @@ pub enum ConversionError {
 }
 
 /// `Conversion` is a place-holder for a type conversion operation, to
-/// convert from a plain (`Bytes`) `ValueKind` into another type. Every
-/// variant of `ValueKind` is represented here.
+/// convert from a plain (`Bytes`) `Value` into another type. Every
+/// variant of `Value` is represented here.
 #[derive(Clone)]
 pub enum Conversion {
     Bytes,
@@ -66,11 +72,11 @@ impl FromStr for Conversion {
 /// Helper function to parse a conversion map and check against a list of names
 pub fn parse_check_conversion_map(
     types: &HashMap<Atom, String>,
-    names: &Vec<Atom>,
+    names: &[Atom],
 ) -> Result<HashMap<Atom, Conversion>, ConversionError> {
     // Check if any named type references a nonexistent field
-    let names: HashSet<Atom> = names.into_iter().map(|s| s.into()).collect();
-    for (name, _) in types {
+    let names: HashSet<Atom> = names.iter().map(|s| s.into()).collect();
+    for name in types.keys() {
         if !names.contains(name) {
             warn!(
                 message = "Field was specified in the types but is not a valid field name.",
@@ -87,11 +93,24 @@ pub fn parse_conversion_map(
     types: &HashMap<Atom, String>,
 ) -> Result<HashMap<Atom, Conversion>, ConversionError> {
     types
-        .into_iter()
+        .iter()
         .map(|(field, typename)| {
             typename
                 .parse::<Conversion>()
                 .map(|conv| (field.clone(), conv))
+        })
+        .collect()
+}
+
+pub fn parse_conversion_map_no_atoms(
+    types: &HashMap<String, String>,
+) -> Result<HashMap<String, Conversion>, ConversionError> {
+    types
+        .iter()
+        .map(|(field, typename)| {
+            typename
+                .parse::<Conversion>()
+                .map(|conv| (field.to_string(), conv))
         })
         .collect()
 }
@@ -112,39 +131,38 @@ pub enum Error {
 
 impl Conversion {
     /// Use this `Conversion` variant to turn the given `value` into a
-    /// new `ValueKind`. This will fail in unexpected ways if the
-    /// `value` is not currently a `ValueKind::Bytes`.
-    pub fn convert(&self, value: ValueKind) -> Result<ValueKind, Error> {
+    /// new `Value`. This will fail in unexpected ways if the
+    /// `value` is not currently a `Value::Bytes`.
+    pub fn convert(&self, value: Value) -> Result<Value, Error> {
         let bytes = value.as_bytes();
         Ok(match self {
             Conversion::Bytes => value,
             Conversion::Integer => {
                 let s = String::from_utf8_lossy(&bytes);
-                ValueKind::Integer(s.parse::<i64>().context(IntParseError { s })?)
+                Value::Integer(s.parse::<i64>().with_context(|| IntParseError { s })?)
             }
             Conversion::Float => {
                 let s = String::from_utf8_lossy(&bytes);
-                ValueKind::Float(s.parse::<f64>().context(FloatParseError { s })?)
+                Value::Float(s.parse::<f64>().with_context(|| FloatParseError { s })?)
             }
-            Conversion::Boolean => {
-                ValueKind::Boolean(parse_bool(&String::from_utf8_lossy(&bytes))?)
-            }
+            Conversion::Boolean => Value::Boolean(parse_bool(&String::from_utf8_lossy(&bytes))?),
 
             Conversion::Timestamp => {
-                ValueKind::Timestamp(parse_timestamp(&String::from_utf8_lossy(&bytes))?)
+                Value::Timestamp(parse_timestamp(&String::from_utf8_lossy(&bytes))?)
             }
             Conversion::TimestampFmt(format) => {
                 let s = String::from_utf8_lossy(&bytes);
-                ValueKind::Timestamp(datetime_to_utc(
+                Value::Timestamp(datetime_to_utc(
                     Local
                         .datetime_from_str(&s, &format)
-                        .context(TimestampParseError { s })?,
+                        .with_context(|| TimestampParseError { s })?,
                 ))
             }
             Conversion::TimestampTZFmt(format) => {
                 let s = String::from_utf8_lossy(&bytes);
-                ValueKind::Timestamp(datetime_to_utc(
-                    DateTime::parse_from_str(&s, &format).context(TimestampParseError { s })?,
+                Value::Timestamp(datetime_to_utc(
+                    DateTime::parse_from_str(&s, &format)
+                        .with_context(|| TimestampParseError { s })?,
                 ))
             }
         })
@@ -224,7 +242,7 @@ const TIMESTAMP_TZ_FORMATS: &[&str] = &[
 ];
 
 /// Parse a string into a timestamp using one of a set of formats
-fn parse_timestamp(s: &str) -> Result<DateTime<Utc>, Error> {
+pub fn parse_timestamp(s: &str) -> Result<DateTime<Utc>, Error> {
     for format in TIMESTAMP_FORMATS {
         if let Ok(result) = Local.datetime_from_str(s, format) {
             return Ok(datetime_to_utc(result));
@@ -251,23 +269,33 @@ fn parse_timestamp(s: &str) -> Result<DateTime<Utc>, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_bool, parse_timestamp, Conversion, Error};
-    use crate::event::ValueKind;
+    use super::parse_bool;
+    #[cfg(unix)]
+    use super::parse_timestamp;
+    #[cfg(unix)]
+    use super::{Conversion, Error};
+    #[cfg(unix)]
+    use crate::event::Value;
+    #[cfg(unix)]
     use chrono::prelude::*;
 
+    #[cfg(unix)]
     const TIMEZONE: &str = "Australia/Brisbane";
 
+    #[cfg(unix)]
     fn dateref() -> DateTime<Utc> {
         Utc.from_utc_datetime(&NaiveDateTime::from_timestamp(981173106, 0))
     }
 
-    fn convert(fmt: &str, value: &str) -> Result<ValueKind, Error> {
+    #[cfg(unix)]
+    fn convert(fmt: &str, value: &str) -> Result<Value, Error> {
         std::env::set_var("TZ", TIMEZONE);
         fmt.parse::<Conversion>()
             .expect(&format!("Invalid conversion {:?}", fmt))
             .convert(value.into())
     }
 
+    #[cfg(unix)] // https://github.com/timberio/vector/issues/1201
     #[test]
     fn timestamp_conversion() {
         assert_eq!(
@@ -276,6 +304,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)] // see https://github.com/timberio/vector/issues/1201
     #[test]
     fn timestamp_param_conversion() {
         assert_eq!(
@@ -284,6 +313,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)] // see https://github.com/timberio/vector/issues/1201
     #[test]
     fn parse_timestamp_auto() {
         std::env::set_var("TZ", TIMEZONE);

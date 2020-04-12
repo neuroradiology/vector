@@ -1,39 +1,44 @@
 #[macro_use]
 extern crate tracing;
 
-use futures::{future, Future, Stream};
+use futures01::{future, Future, Stream};
 use std::{
-    cmp::{max, min},
+    cmp::max,
     fs::File,
-    net::SocketAddr,
     path::{Path, PathBuf},
 };
-use structopt::StructOpt;
+use structopt::{clap::AppSettings, StructOpt};
+#[cfg(unix)]
 use tokio_signal::unix::{Signal, SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use topology::Config;
-use tracing::{field, Dispatch};
-use tracing_futures::Instrument;
-use tracing_metrics::MetricsSubscriber;
-use vector::{metrics, topology};
+use vector::{config_paths, event, generate, list, metrics, runtime, topology, trace, unit_test};
 
 #[derive(StructOpt, Debug)]
 #[structopt(rename_all = "kebab-case")]
 struct Opts {
-    /// Read configuration from the specified file
-    #[structopt(name = "config", value_name = "FILE", short, long)]
-    config_path: PathBuf,
+    #[structopt(flatten)]
+    root: RootOpts,
+
+    #[structopt(subcommand)]
+    sub_command: Option<SubCommand>,
+}
+
+#[derive(StructOpt, Debug)]
+#[structopt(rename_all = "kebab-case")]
+struct RootOpts {
+    /// Read configuration from one or more files. Wildcard paths are supported.
+    /// If zero files are specified the default config path
+    /// `/etc/vector/vector.toml` will be targeted.
+    #[structopt(name = "config", short, long)]
+    config_paths: Vec<PathBuf>,
 
     /// Exit on startup if any sinks fail healthchecks
     #[structopt(short, long)]
     require_healthy: bool,
 
-    /// Exit on startup after config verification and optional healthchecks run
+    /// Exit on startup after config verification and optional healthchecks are run
     #[structopt(short, long)]
     dry_run: bool,
-
-    /// Serve internal metrics from the given address
-    #[structopt(short, long)]
-    metrics_addr: Option<SocketAddr>,
 
     /// Number of threads to use for processing (default is number of available cores)
     #[structopt(short, long)]
@@ -47,6 +52,10 @@ struct Opts {
     #[structopt(short, long, parse(from_occurrences))]
     quiet: u8,
 
+    /// Set the logging format. Options are "text" or "json". Defaults to "text".
+    #[structopt(long)]
+    log_format: Option<LogFormat>,
+
     /// Control when ANSI terminal formatting is used.
     ///
     /// By default `vector` will try and detect if `stdout` is a terminal, if it is
@@ -58,6 +67,43 @@ struct Opts {
     /// Options: `auto`, `always` or `never`
     #[structopt(long)]
     color: Option<Color>,
+
+    /// Watch for changes in configuration file, and reload accordingly.
+    #[structopt(short, long)]
+    watch_config: bool,
+}
+
+#[derive(StructOpt, Debug)]
+#[structopt(rename_all = "kebab-case")]
+enum SubCommand {
+    /// Validate the target config, then exit.
+    Validate(Validate),
+
+    /// Generate a Vector configuration containing a list of components.
+    Generate(generate::Opts),
+
+    /// List available components, then exit.
+    List(list::Opts),
+
+    /// Run Vector config unit tests, then exit. This command is experimental and therefore subject to change.
+    /// For guidance on how to write unit tests check out: https://vector.dev/docs/setup/guides/unit-testing/
+    Test(unit_test::Opts),
+}
+
+#[derive(StructOpt, Debug)]
+#[structopt(rename_all = "kebab-case")]
+struct Validate {
+    /// Ensure that the config topology is correct and that all components resolve
+    #[structopt(short, long)]
+    topology: bool,
+
+    /// Fail validation on warnings
+    #[structopt(short, long)]
+    deny_warnings: bool,
+
+    /// Any number of Vector config files to validate. If none are specified the
+    /// default config path `/etc/vector/vector.toml` will be targeted.
+    paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +111,12 @@ enum Color {
     Auto,
     Always,
     Never,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 impl std::str::FromStr for Color {
@@ -83,8 +135,32 @@ impl std::str::FromStr for Color {
     }
 }
 
+impl std::str::FromStr for LogFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "text" => Ok(LogFormat::Text),
+            "json" => Ok(LogFormat::Json),
+            s => Err(format!(
+                "{} is not a valid option, expected `text` or `json`",
+                s
+            )),
+        }
+    }
+}
+
 fn main() {
-    let opts = Opts::from_args();
+    openssl_probe::init_ssl_cert_env_vars();
+    let version = vector::get_version();
+    let app = Opts::clap().version(&version[..]).global_settings(&[
+        AppSettings::ColoredHelp,
+        AppSettings::InferSubcommands,
+        AppSettings::DeriveDisplayOrder,
+    ]);
+    let root_opts = Opts::from_clap(&app.get_matches());
+    let opts = root_opts.root;
+    let sub_command = root_opts.sub_command;
 
     let level = match opts.quiet {
         0 => match opts.verbose {
@@ -93,127 +169,136 @@ fn main() {
             2..=255 => "trace",
         },
         1 => "warn",
-        2..=255 => "error",
+        2 => "error",
+        3..=255 => "off",
     };
 
-    let mut levels = [
-        format!("vector={}", level),
-        format!("codec={}", level),
-        format!("file_source={}", level),
-    ]
-    .join(",")
-    .to_string();
-
-    if let Ok(level) = std::env::var("LOG") {
-        let additional_level = ",".to_owned() + level.as_str();
-        levels.push_str(&additional_level);
+    let levels = match std::env::var("LOG").ok() {
+        Some(level) => level,
+        None => match level {
+            "off" => "off".to_string(),
+            _ => [
+                format!("vector={}", level),
+                format!("codec={}", level),
+                format!("file_source={}", level),
+                format!("tower_limit=trace"),
+                format!("rdkafka={}", level),
+            ]
+            .join(",")
+            .to_string(),
+        },
     };
 
     let color = match opts.color.clone().unwrap_or(Color::Auto) {
+        #[cfg(unix)]
         Color::Auto => atty::is(atty::Stream::Stdout),
+        #[cfg(windows)]
+        Color::Auto => false, // ANSI colors are not supported by cmd.exe
         Color::Always => true,
         Color::Never => false,
     };
 
-    let subscriber = tracing_fmt::FmtSubscriber::builder()
-        .with_ansi(color)
-        .with_filter(tracing_fmt::filter::EnvFilter::from(levels.as_str()))
-        .finish();
-    tracing_env_logger::try_init().expect("init log adapter");
-
-    let (metrics_controller, metrics_sink) = metrics::build();
-    let dispatch = if opts.metrics_addr.is_some() {
-        Dispatch::new(MetricsSubscriber::new(subscriber, metrics_sink))
-    } else {
-        Dispatch::new(subscriber)
+    let json = match &opts.log_format.unwrap_or(LogFormat::Text) {
+        LogFormat::Text => false,
+        LogFormat::Json => true,
     };
 
-    tracing::dispatcher::with_default(&dispatch, || {
-        info!("Log level {:?} is enabled.", level);
+    trace::init(color, json, levels.as_str());
 
-        if let Some(threads) = opts.threads {
-            if threads < 1 || threads > 4 {
-                error!("The `threads` argument must be between 1 and 4 (inclusive).");
-                std::process::exit(exitcode::CONFIG);
-            }
-        }
+    metrics::init().expect("metrics initialization failed");
 
-        info!(
-            message = "Loading config.",
-            path = field::debug(&opts.config_path)
-        );
+    sub_command.map(|s| {
+        std::process::exit(match s {
+            SubCommand::Validate(v) => validate(&v),
+            SubCommand::List(l) => list::cmd(&l),
+            SubCommand::Test(t) => unit_test::cmd(&t),
+            SubCommand::Generate(g) => generate::cmd(&g),
+        })
+    });
 
-        let file = if let Some(file) = open_config(&opts.config_path) {
-            file
-        } else {
+    info!("Log level {:?} is enabled.", level);
+
+    if let Some(threads) = opts.threads {
+        if threads < 1 {
+            error!("The `threads` argument must be greater or equal to 1.");
             std::process::exit(exitcode::CONFIG);
-        };
-
-        trace!(
-            message = "Parsing config.",
-            path = field::debug(&opts.config_path)
-        );
-
-        let config = vector::topology::Config::load(file);
-        let config = handle_config_errors(config);
-        let config = config.unwrap_or_else(|| {
-            std::process::exit(exitcode::CONFIG);
-        });
-
-        let mut rt = {
-            let mut builder = tokio::runtime::Builder::new();
-
-            let threads = opts.threads.unwrap_or(max(1, num_cpus::get()));
-            builder.core_threads(min(4, threads));
-
-            builder.build().expect("Unable to create async runtime")
-        };
-
-        let (metrics_trigger, metrics_tripwire) = stream_cancel::Tripwire::new();
-
-        if let Some(metrics_addr) = opts.metrics_addr {
-            debug!("Starting metrics server");
-
-            rt.spawn(
-                metrics::serve(&metrics_addr, metrics_controller)
-                    .instrument(info_span!("metrics", addr = field::display(&metrics_addr)))
-                    .select(metrics_tripwire)
-                    .map(|_| ())
-                    .map_err(|_| ()),
-            );
         }
+    }
 
-        info!(
-            message = "Vector is starting.",
-            version = built_info::PKG_VERSION,
-            git_version = built_info::GIT_VERSION.unwrap_or(""),
-            released = built_info::BUILT_TIME_UTC,
-            arch = built_info::CFG_TARGET_ARCH
-        );
+    let mut config_paths = config_paths::expand(opts.config_paths.clone()).unwrap_or_else(|| {
+        std::process::exit(exitcode::CONFIG);
+    });
+    config_paths.sort();
+    config_paths.dedup();
+    config_paths::CONFIG_PATHS
+        .set(config_paths.clone())
+        .expect("Cannot set global config paths");
 
-        if opts.dry_run {
-            info!("Dry run enabled, exiting after config validation.");
-        }
-
-        let pieces = topology::validate(&config).unwrap_or_else(|| {
+    if opts.watch_config {
+        // Start listening for config changes immediately.
+        vector::topology::config::watcher::config_watcher(
+            config_paths.clone(),
+            vector::topology::config::watcher::CONFIG_WATCH_DELAY,
+        )
+        .unwrap_or_else(|error| {
+            error!(message = "Unable to start config watcher.", %error);
             std::process::exit(exitcode::CONFIG);
         });
+    }
 
-        if opts.dry_run && !opts.require_healthy {
-            info!("Config validated, exiting.");
-            std::process::exit(exitcode::OK);
-        }
+    info!(
+        message = "Loading configs.",
+        path = ?config_paths
+    );
 
-        let result = topology::start_validated(config, pieces, &mut rt, opts.require_healthy);
-        let (mut topology, mut graceful_crash) = result.unwrap_or_else(|| {
-            std::process::exit(exitcode::CONFIG);
-        });
+    let config = read_configs(&config_paths);
+    let config = handle_config_errors(config);
+    let config = config.unwrap_or_else(|| {
+        std::process::exit(exitcode::CONFIG);
+    });
+    event::LOG_SCHEMA
+        .set(config.global.log_schema.clone())
+        .expect("Couldn't set schema");
 
-        if opts.dry_run {
-            info!("Healthchecks passed, exiting.");
-            std::process::exit(exitcode::OK);
-        }
+    let mut rt = {
+        let threads = opts.threads.unwrap_or(max(1, num_cpus::get()));
+        runtime::Runtime::with_thread_count(threads).expect("Unable to create async runtime")
+    };
 
+    info!(
+        message = "Vector is starting.",
+        version = built_info::PKG_VERSION,
+        git_version = built_info::GIT_VERSION.unwrap_or(""),
+        released = built_info::BUILT_TIME_UTC,
+        arch = built_info::CFG_TARGET_ARCH
+    );
+
+    if opts.dry_run {
+        info!("Dry run enabled, exiting after config validation.");
+    }
+
+    let pieces = topology::validate(&config, rt.executor()).unwrap_or_else(|| {
+        std::process::exit(exitcode::CONFIG);
+    });
+
+    if opts.dry_run && !opts.require_healthy {
+        info!("Config validated, exiting.");
+        std::process::exit(exitcode::OK);
+    }
+
+    let result = topology::start_validated(config, pieces, &mut rt, opts.require_healthy);
+    let (topology, mut graceful_crash) = result.unwrap_or_else(|| {
+        std::process::exit(exitcode::CONFIG);
+    });
+
+    if opts.dry_run {
+        info!("Healthchecks passed, exiting.");
+        std::process::exit(exitcode::OK);
+    }
+
+    #[cfg(unix)]
+    {
+        let mut topology = topology;
         let sigint = Signal::new(SIGINT).flatten_stream();
         let sigterm = Signal::new(SIGTERM).flatten_stream();
         let sigquit = Signal::new(SIGQUIT).flatten_stream();
@@ -242,18 +327,12 @@ fn main() {
 
             // Reload config
             info!(
-                message = "Reloading config.",
-                path = field::debug(&opts.config_path)
+                message = "Reloading configs.",
+                path = ?config_paths
             );
-
-            let file = if let Some(file) = open_config(&opts.config_path) {
-                file
-            } else {
-                continue;
-            };
+            let config = read_configs(&config_paths);
 
             trace!("Parsing config");
-            let config = vector::topology::Config::load(file);
             let config = handle_config_errors(config);
             if let Some(config) = config {
                 let success =
@@ -267,11 +346,10 @@ fn main() {
         };
 
         if signal == SIGINT || signal == SIGTERM {
-            use futures::future::Either;
+            use futures01::future::Either;
 
             info!("Shutting down.");
             let shutdown = topology.stop();
-            metrics_trigger.cancel();
 
             match rt.block_on(shutdown.select2(signals.into_future())) {
                 Ok(Either::A(_)) => { /* Graceful shutdown finished */ }
@@ -287,9 +365,39 @@ fn main() {
         } else {
             unreachable!();
         }
+    }
+    #[cfg(windows)]
+    {
+        let ctrl_c = tokio_signal::ctrl_c().flatten_stream().into_future();
+        let crash = future::poll_fn(move || graceful_crash.poll());
 
-        rt.shutdown_now().wait().unwrap();
-    });
+        let interruption = rt
+            .block_on(ctrl_c.select2(crash))
+            .map_err(|_| ())
+            .expect("Neither stream errors");
+
+        use futures01::future::Either;
+
+        let ctrl_c = match interruption {
+            Either::A(((_, ctrl_c_stream), _)) => ctrl_c_stream.into_future(),
+            Either::B((_, ctrl_c)) => ctrl_c,
+        };
+
+        info!("Shutting down.");
+        let shutdown = topology.stop();
+        metrics_trigger.cancel();
+
+        match rt.block_on(shutdown.select2(ctrl_c)) {
+            Ok(Either::A(_)) => { /* Graceful shutdown finished */ }
+            Ok(Either::B(_)) => {
+                info!("Shutting down immediately.");
+                // Dropping the shutdown future will immediately shut the server down
+            }
+            Err(_) => unreachable!(),
+        }
+    }
+
+    rt.shutdown_now().wait().unwrap();
 }
 
 fn handle_config_errors(config: Result<Config, Vec<String>>) -> Option<Config> {
@@ -304,15 +412,46 @@ fn handle_config_errors(config: Result<Config, Vec<String>>) -> Option<Config> {
     }
 }
 
+fn read_configs(config_paths: &Vec<PathBuf>) -> Result<Config, Vec<String>> {
+    let mut config = vector::topology::Config::empty();
+    let mut errors = Vec::new();
+
+    config_paths.iter().for_each(|p| {
+        let file = if let Some(file) = open_config(&p) {
+            file
+        } else {
+            errors.push(format!("Config file not found in path: {:?}.", p));
+            return;
+        };
+
+        trace!(
+            message = "Parsing config.",
+            path = ?p
+        );
+
+        match Config::load(file).and_then(|n| config.append(n)) {
+            Err(errs) => errors.extend(errs.iter().map(|e| format!("{:?}: {}", p, e))),
+            _ => (),
+        };
+    });
+
+    if let Err(mut errs) = config.expand_macros() {
+        errors.append(&mut errs);
+    }
+
+    if !errors.is_empty() {
+        Err(errors)
+    } else {
+        Ok(config)
+    }
+}
+
 fn open_config(path: &Path) -> Option<File> {
     match File::open(path) {
         Ok(f) => Some(f),
         Err(error) => {
             if let std::io::ErrorKind::NotFound = error.kind() {
-                error!(
-                    message = "Config file not found in path.",
-                    path = field::display(path.display()),
-                );
+                error!(message = "Config file not found in path.", ?path);
                 None
             } else {
                 error!(message = "Error opening config file.", %error);
@@ -320,6 +459,79 @@ fn open_config(path: &Path) -> Option<File> {
             }
         }
     }
+}
+
+fn validate(opts: &Validate) -> exitcode::ExitCode {
+    let paths = config_paths::expand(opts.paths.clone()).unwrap_or_else(|| {
+        std::process::exit(exitcode::CONFIG);
+    });
+
+    for config_path in paths {
+        let file = if let Some(file) = open_config(&config_path) {
+            file
+        } else {
+            error!(
+                message = "Failed to open config file.",
+                path = ?config_path
+            );
+            return exitcode::CONFIG;
+        };
+
+        trace!(
+            message = "Parsing config.",
+            path = ?config_path
+        );
+
+        let config = vector::topology::Config::load(file);
+        let config = handle_config_errors(config);
+        let mut config = config.unwrap_or_else(|| {
+            error!(
+                message = "Failed to parse config file.",
+                path = ?config_path
+            );
+            std::process::exit(exitcode::CONFIG);
+        });
+        if let Err(errs) = config.expand_macros() {
+            for error in errs {
+                error!("Parse error: {}", error);
+            }
+        }
+
+        if opts.topology {
+            let exit = match topology::builder::check(&config) {
+                Err(errors) => {
+                    for error in errors {
+                        error!("Topology error: {}", error);
+                    }
+                    Some(exitcode::CONFIG)
+                }
+                Ok(warnings) => {
+                    for warning in &warnings {
+                        warn!("Topology warning: {}", warning);
+                    }
+                    if opts.deny_warnings && !warnings.is_empty() {
+                        Some(exitcode::CONFIG)
+                    } else {
+                        None
+                    }
+                }
+            };
+            if exit.is_some() {
+                error!(
+                    message = "Failed to verify config file topology.",
+                    path = ?config_path
+                );
+                return exit.unwrap();
+            }
+        }
+
+        debug!(
+            message = "Validation successful.",
+            path = ?config_path
+        );
+    }
+
+    exitcode::OK
 }
 
 #[allow(unused)]

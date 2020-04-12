@@ -1,16 +1,16 @@
-use super::fanout::{self, Fanout};
-use crate::{buffers, topology::config::GlobalOptions};
-use futures::{
+use super::{
+    config::{DataType, SinkContext, TransformContext},
+    fanout::{self, Fanout},
+    task::Task,
+};
+use crate::{buffers, dns::Resolver, event::Event, runtime, shutdown::SourceShutdownCoordinator};
+use futures01::{
     future::{lazy, Either},
     sync::mpsc,
     Future, Stream,
 };
 use std::{collections::HashMap, time::Duration};
-use stream_cancel::{Trigger, Tripwire};
-use tokio::util::FutureExt;
-use tracing_futures::Instrument;
-
-pub type Task = Box<dyn Future<Item = (), Error = ()> + Send>;
+use tokio01::util::FutureExt;
 
 pub struct Pieces {
     pub inputs: HashMap<String, (buffers::BufferInputCloner, Vec<String>)>,
@@ -18,126 +18,12 @@ pub struct Pieces {
     pub tasks: HashMap<String, Task>,
     pub source_tasks: HashMap<String, Task>,
     pub healthchecks: HashMap<String, Task>,
-    pub shutdown_triggers: HashMap<String, Trigger>,
+    pub shutdown_coordinator: SourceShutdownCoordinator,
 }
 
-pub fn build_pieces(config: &super::Config) -> Result<(Pieces, Vec<String>), Vec<String>> {
-    let mut inputs = HashMap::new();
-    let mut outputs = HashMap::new();
-    let mut tasks = HashMap::new();
-    let mut source_tasks = HashMap::new();
-    let mut healthchecks = HashMap::new();
-    let mut shutdown_triggers = HashMap::new();
-
+pub fn check(config: &super::Config) -> Result<Vec<String>, Vec<String>> {
     let mut errors = vec![];
     let mut warnings = vec![];
-
-    let globals = GlobalOptions::from(config);
-
-    // Build sources
-    for (name, source) in &config.sources {
-        let (tx, rx) = mpsc::channel(1000);
-
-        let server = match source.build(&name, &globals, tx) {
-            Err(error) => {
-                errors.push(format!("Source \"{}\": {}", name, error));
-                continue;
-            }
-            Ok(server) => server,
-        };
-
-        let (trigger, tripwire) = Tripwire::new();
-
-        let (output, control) = Fanout::new();
-        let pump = rx.forward(output).map(|_| ());
-        let pump: Task = Box::new(pump);
-
-        let server = server.select(tripwire.clone()).map(|_| ()).map_err(|_| ());
-        let server: Task = Box::new(server);
-
-        outputs.insert(name.clone(), control);
-        tasks.insert(name.clone(), pump);
-        source_tasks.insert(name.clone(), server);
-        shutdown_triggers.insert(name.clone(), trigger);
-    }
-
-    // Build transforms
-    for (name, transform) in &config.transforms {
-        let trans_inputs = &transform.inputs;
-        let mut transform = match transform.inner.build() {
-            Err(error) => {
-                errors.push(format!("Transform \"{}\": {}", name, error));
-                continue;
-            }
-            Ok(transform) => transform,
-        };
-
-        let (input_tx, input_rx) = futures::sync::mpsc::channel(100);
-        let input_tx = buffers::BufferInputCloner::Memory(input_tx, buffers::WhenFull::Block);
-
-        let (output, control) = Fanout::new();
-
-        let task = input_rx
-            .map(move |event| {
-                let mut output = Vec::with_capacity(1);
-                transform.transform_into(&mut output, event);
-                futures::stream::iter_ok(output.into_iter())
-            })
-            .flatten()
-            .forward(output)
-            .map(|_| ());
-        let task: Task = Box::new(task);
-
-        inputs.insert(name.clone(), (input_tx, trans_inputs.clone()));
-        outputs.insert(name.clone(), control);
-        tasks.insert(name.clone(), task);
-    }
-
-    // Build sinks
-    for (name, sink) in &config.sinks {
-        let sink_inputs = &sink.inputs;
-        let enable_healthcheck = sink.healthcheck;
-
-        let buffer = sink.buffer.build(&config.data_dir, &name);
-        let (tx, rx, acker) = match buffer {
-            Err(error) => {
-                errors.push(format!("Sink \"{}\": {}", name, error));
-                continue;
-            }
-            Ok(buffer) => buffer,
-        };
-
-        let (sink, healthcheck) = match sink.inner.build(acker) {
-            Err(error) => {
-                errors.push(format!("Sink \"{}\": {}", name, error));
-                continue;
-            }
-            Ok((sink, healthcheck)) => (sink, healthcheck),
-        };
-
-        let task = rx.forward(sink).map(|_| ());
-        let task: Task = Box::new(task);
-
-        let healthcheck_task = if enable_healthcheck {
-            let healthcheck_task = healthcheck
-                // TODO: Add healthcheck timeouts per sink
-                .timeout(Duration::from_secs(10))
-                .map(move |_| info!("Healthcheck: Passed."))
-                .map_err(move |err| error!("Healthcheck: Failed Reason: {}", err));
-            Either::A(healthcheck_task)
-        } else {
-            Either::B(lazy(|| {
-                info!("Healthcheck: Disabled.");
-                Ok(())
-            }))
-        };
-        let healthcheck_fut: Box<dyn Future<Item = (), Error = ()> + Send + 'static> =
-            Box::new(healthcheck_task.instrument(info_span!("healthcheck", %name)));
-
-        inputs.insert(name.clone(), (tx, sink_inputs.clone()));
-        healthchecks.insert(name.clone(), healthcheck_fut);
-        tasks.insert(name.clone(), task);
-    }
 
     // Warnings and errors
     let sink_inputs = config
@@ -183,17 +69,182 @@ pub fn build_pieces(config: &super::Config) -> Result<(Pieces, Vec<String>), Vec
                 .any(|(_, sink)| sink.inputs.contains(&name))
         {
             warnings.push(format!(
-                "{} {:?} has no outputs",
+                "{} {:?} has no consumers",
                 capitalize(input_type),
                 name
             ));
         }
     }
 
-    if config.contains_cycle() {
-        errors.push(format!("Configured topology contains a cycle"));
-    } else if let Err(type_errors) = config.typecheck() {
+    if let Err(type_errors) = config.typecheck() {
         errors.extend(type_errors);
+    }
+
+    if errors.is_empty() {
+        Ok(warnings)
+    } else {
+        Err(errors)
+    }
+}
+
+pub fn build_pieces(
+    config: &super::Config,
+    exec: runtime::TaskExecutor,
+) -> Result<(Pieces, Vec<String>), Vec<String>> {
+    let mut inputs = HashMap::new();
+    let mut outputs = HashMap::new();
+    let mut tasks = HashMap::new();
+    let mut source_tasks = HashMap::new();
+    let mut healthchecks = HashMap::new();
+    let mut shutdown_coordinator = SourceShutdownCoordinator::new();
+
+    let mut errors = vec![];
+    let mut warnings = vec![];
+
+    if config.sources.is_empty() {
+        return Err(vec!["No sources defined in the config.".to_owned()]);
+    }
+    if config.sinks.is_empty() {
+        return Err(vec!["No sinks defined in the config.".to_owned()]);
+    }
+
+    // TODO: remove the unimplemented
+    let resolver = Resolver::new(config.global.dns_servers.clone(), exec.clone()).unwrap();
+
+    // Build sources
+    for (name, source) in &config.sources {
+        let (tx, rx) = mpsc::channel(1000);
+
+        let typetag = source.source_type();
+
+        let (shutdown_signal, force_shutdown_tripwire) = shutdown_coordinator.register_source(name);
+
+        let server = match source.build(&name, &config.global, shutdown_signal, tx) {
+            Err(error) => {
+                errors.push(format!("Source \"{}\": {}", name, error));
+                continue;
+            }
+            Ok(server) => server,
+        };
+
+        let (output, control) = Fanout::new();
+        let pump = rx.forward(output).map(|_| ());
+        let pump = Task::new(&name, &typetag, pump);
+
+        // The force_shutdown_tripwire is a Future that when it resolves means that this source
+        // has failed to shut down gracefully within its allotted time window and instead should be
+        // forcibly shut down.  We accomplish this by select()-ing on the server Task with the
+        // force_shutdown_tripwire.  That means that if the force_shutdown_tripwire resolves while
+        // the server Task is still running the Task will simply be dropped on the floor.
+        let server = server
+            .select(force_shutdown_tripwire)
+            .map(|_| ())
+            .map_err(|_| ());
+        let server = Task::new(&name, &typetag, server);
+
+        outputs.insert(name.clone(), control);
+        tasks.insert(name.clone(), pump);
+        source_tasks.insert(name.clone(), server);
+    }
+
+    // Build transforms
+    for (name, transform) in &config.transforms {
+        let trans_inputs = &transform.inputs;
+
+        let typetag = &transform.inner.transform_type();
+
+        let cx = TransformContext {
+            resolver: resolver.clone(),
+            exec: exec.clone(),
+        };
+
+        let input_type = transform.inner.input_type();
+        let transform = match transform.inner.build(cx) {
+            Err(error) => {
+                errors.push(format!("Transform \"{}\": {}", name, error));
+                continue;
+            }
+            Ok(transform) => transform,
+        };
+
+        let (input_tx, input_rx) = futures01::sync::mpsc::channel(100);
+        let input_tx = buffers::BufferInputCloner::Memory(input_tx, buffers::WhenFull::Block);
+
+        let (output, control) = Fanout::new();
+
+        let transform = transform
+            .transform_stream(filter_event_type(input_rx, input_type))
+            .forward(output)
+            .map(|_| ());
+        let task = Task::new(&name, &typetag, transform);
+
+        inputs.insert(name.clone(), (input_tx, trans_inputs.clone()));
+        outputs.insert(name.clone(), control);
+        tasks.insert(name.clone(), task);
+    }
+
+    // Build sinks
+    for (name, sink) in &config.sinks {
+        let sink_inputs = &sink.inputs;
+        let enable_healthcheck = sink.healthcheck;
+
+        let typetag = sink.inner.sink_type();
+        let input_type = sink.inner.input_type();
+
+        let buffer = sink.buffer.build(&config.global.data_dir, &name);
+        let (tx, rx, acker) = match buffer {
+            Err(error) => {
+                errors.push(format!("Sink \"{}\": {}", name, error));
+                continue;
+            }
+            Ok(buffer) => buffer,
+        };
+
+        let cx = SinkContext {
+            resolver: resolver.clone(),
+            acker,
+            exec: exec.clone(),
+        };
+
+        let (sink, healthcheck) = match sink.inner.build(cx) {
+            Err(error) => {
+                errors.push(format!("Sink \"{}\": {}", name, error));
+                continue;
+            }
+            Ok((sink, healthcheck)) => (sink, healthcheck),
+        };
+
+        let sink = filter_event_type(rx, input_type).forward(sink).map(|_| ());
+        let task = Task::new(&name, &typetag, sink);
+
+        let healthcheck_task = if enable_healthcheck {
+            let healthcheck_task = healthcheck
+                // TODO: Add healthcheck timeouts per sink
+                .timeout(Duration::from_secs(10))
+                .map(move |_| info!("Healthcheck: Passed."))
+                .map_err(move |err| error!("Healthcheck: Failed Reason: {}", err));
+            Either::A(healthcheck_task)
+        } else {
+            Either::B(lazy(|| {
+                info!("Healthcheck: Disabled.");
+                Ok(())
+            }))
+        };
+        let healthcheck_task = Task::new(&name, &typetag, healthcheck_task);
+
+        inputs.insert(name.clone(), (tx, sink_inputs.clone()));
+        healthchecks.insert(name.clone(), healthcheck_task);
+        tasks.insert(name.clone(), task);
+    }
+
+    // Warnings and errors
+    match check(&config) {
+        Err(check_errors) => {
+            errors.extend(check_errors);
+        }
+        Ok(check_warnings) => {
+            warnings.extend(check_warnings);
+        }
     }
 
     if errors.is_empty() {
@@ -203,7 +254,7 @@ pub fn build_pieces(config: &super::Config) -> Result<(Pieces, Vec<String>), Vec
             tasks,
             source_tasks,
             healthchecks,
-            shutdown_triggers,
+            shutdown_coordinator,
         };
 
         Ok((pieces, warnings))
@@ -218,4 +269,24 @@ fn capitalize(s: &str) -> String {
         r.make_ascii_uppercase();
     }
     s
+}
+
+fn filter_event_type<S>(
+    stream: S,
+    data_type: DataType,
+) -> Box<dyn Stream<Item = Event, Error = ()> + Send>
+where
+    S: Stream<Item = Event, Error = ()> + Send + 'static,
+{
+    match data_type {
+        DataType::Any => Box::new(stream), // it's possible to not call any comparing function if any type is supported
+        DataType::Log => Box::new(stream.filter(|event| match event {
+            Event::Log(_) => true,
+            _ => false,
+        })),
+        DataType::Metric => Box::new(stream.filter(|event| match event {
+            Event::Metric(_) => true,
+            _ => false,
+        })),
+    }
 }

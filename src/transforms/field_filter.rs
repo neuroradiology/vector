@@ -1,7 +1,7 @@
 use super::Transform;
 use crate::{
-    topology::config::{DataType, TransformConfig},
-    Event,
+    event::Event,
+    topology::config::{DataType, TransformConfig, TransformContext, TransformDescription},
 };
 use serde::{Deserialize, Serialize};
 use string_cache::DefaultAtom as Atom;
@@ -13,9 +13,17 @@ pub struct FieldFilterConfig {
     pub value: String,
 }
 
+inventory::submit! {
+    TransformDescription::new_without_default::<FieldFilterConfig>("field_filter")
+}
+
 #[typetag::serde(name = "field_filter")]
 impl TransformConfig for FieldFilterConfig {
-    fn build(&self) -> Result<Box<dyn Transform>, String> {
+    fn build(&self, _cx: TransformContext) -> crate::Result<Box<dyn Transform>> {
+        warn!(
+            message =
+                r#"The "field_filter" transform is deprecated, use the "filter" transform instead"#
+        );
         Ok(Box::new(FieldFilter::new(
             self.field.clone(),
             self.value.clone(),
@@ -28,6 +36,10 @@ impl TransformConfig for FieldFilterConfig {
 
     fn output_type(&self) -> DataType {
         DataType::Log
+    }
+
+    fn transform_type(&self) -> &'static str {
+        "field_filter"
     }
 }
 

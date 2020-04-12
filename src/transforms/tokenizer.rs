@@ -1,7 +1,7 @@
 use super::Transform;
 use crate::{
     event::{self, Event},
-    topology::config::{DataType, TransformConfig},
+    topology::config::{DataType, TransformConfig, TransformContext, TransformDescription},
     types::{parse_check_conversion_map, Conversion},
 };
 use nom::{
@@ -26,13 +26,19 @@ pub struct TokenizerConfig {
     pub types: HashMap<Atom, String>,
 }
 
+inventory::submit! {
+    TransformDescription::new::<TokenizerConfig>("tokenizer")
+}
+
 #[typetag::serde(name = "tokenizer")]
 impl TransformConfig for TokenizerConfig {
-    fn build(&self) -> Result<Box<dyn Transform>, String> {
-        let field = self.field.as_ref().unwrap_or(&event::MESSAGE);
+    fn build(&self, _cx: TransformContext) -> crate::Result<Box<dyn Transform>> {
+        let field = self
+            .field
+            .as_ref()
+            .unwrap_or(&event::log_schema().message_key());
 
-        let types = parse_check_conversion_map(&self.types, &self.field_names)
-            .map_err(|err| format!("{}", err))?;
+        let types = parse_check_conversion_map(&self.types, &self.field_names)?;
 
         // don't drop the source field if it's getting overwritten by a parsed value
         let drop_field = self.drop_field && !self.field_names.iter().any(|f| f == field);
@@ -51,6 +57,10 @@ impl TransformConfig for TokenizerConfig {
 
     fn output_type(&self) -> DataType {
         DataType::Log
+    }
+
+    fn transform_type(&self) -> &'static str {
+        "tokenizer"
     }
 }
 
@@ -91,12 +101,15 @@ impl Transform for Tokenizer {
             for ((name, conversion), value) in self.field_names.iter().zip(parse(value).into_iter())
             {
                 match conversion.convert(value.as_bytes().into()) {
-                    Ok(value) => event.as_mut_log().insert_explicit(name.clone(), value),
+                    Ok(value) => {
+                        event.as_mut_log().insert(name.clone(), value);
+                    }
                     Err(error) => {
                         debug!(
                             message = "Could not convert types.",
                             name = &name[..],
-                            %error
+                            %error,
+                            rate_limit_secs = 30
                         );
                     }
                 }
@@ -133,7 +146,7 @@ pub fn parse(input: &str) -> Vec<&str> {
     );
 
     // fall back to returning the rest of the input, if any
-    let remainder = verify(rest, |s: &str| s.len() > 0);
+    let remainder = verify(rest, |s: &str| !s.is_empty());
     let field = alt((bracket, string, simple, remainder));
 
     all_consuming(many0(terminated(field, space0)))(input)
@@ -145,8 +158,11 @@ pub fn parse(input: &str) -> Vec<&str> {
 mod tests {
     use super::parse;
     use super::TokenizerConfig;
-    use crate::event::{LogEvent, ValueKind};
-    use crate::{topology::config::TransformConfig, Event};
+    use crate::event::{LogEvent, Value};
+    use crate::{
+        topology::config::{TransformConfig, TransformContext},
+        Event,
+    };
     use string_cache::DefaultAtom as Atom;
 
     #[test]
@@ -247,6 +263,7 @@ mod tests {
         drop_field: bool,
         types: &[(&str, &str)],
     ) -> LogEvent {
+        let rt = crate::runtime::Runtime::single_threaded().unwrap();
         let event = Event::from(text);
         let field_names = fields.split(' ').map(|s| s.into()).collect::<Vec<Atom>>();
         let field = field.map(|f| f.into());
@@ -257,7 +274,7 @@ mod tests {
             types: types.iter().map(|&(k, v)| (k.into(), v.into())).collect(),
             ..Default::default()
         }
-        .build()
+        .build(TransformContext::new_test(rt.executor()))
         .unwrap();
 
         parser.transform(event).unwrap().into_log()
@@ -299,10 +316,10 @@ mod tests {
             &[("flag", "bool"), ("code", "integer"), ("number", "float")],
         );
 
-        assert_eq!(log[&"number".into()], ValueKind::Float(42.3));
-        assert_eq!(log[&"flag".into()], ValueKind::Boolean(true));
-        assert_eq!(log[&"code".into()], ValueKind::Integer(1234));
-        assert_eq!(log[&"rest".into()], ValueKind::Bytes("word".into()));
+        assert_eq!(log[&"number".into()], Value::Float(42.3));
+        assert_eq!(log[&"flag".into()], Value::Boolean(true));
+        assert_eq!(log[&"code".into()], Value::Integer(1234));
+        assert_eq!(log[&"rest".into()], Value::Bytes("word".into()));
     }
 
     #[test]
@@ -314,8 +331,8 @@ mod tests {
             false,
             &[("code", "integer"), ("who", "string"), ("why", "string")],
         );
-        assert_eq!(log[&"code".into()], ValueKind::Integer(1234));
-        assert_eq!(log[&"who".into()], ValueKind::Bytes("-".into()));
-        assert_eq!(log[&"why".into()], ValueKind::Bytes("foo".into()));
+        assert_eq!(log[&"code".into()], Value::Integer(1234));
+        assert_eq!(log[&"who".into()], Value::Bytes("-".into()));
+        assert_eq!(log[&"why".into()], Value::Bytes("foo".into()));
     }
 }

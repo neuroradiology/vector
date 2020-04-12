@@ -1,34 +1,61 @@
 use crate::{
     buffers::Acker,
     event::{self, Event},
-    sinks::util::MetadataFuture,
-    topology::config::{DataType, SinkConfig},
+    kafka::{KafkaCompression, KafkaTlsConfig},
+    serde::to_string,
+    sinks::util::encoding::{EncodingConfig, EncodingConfigWithDefault, EncodingConfiguration},
+    topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
 };
-use futures::{
-    future::{self, poll_fn, IntoFuture},
-    stream::FuturesUnordered,
-    Async, AsyncSink, Future, Poll, Sink, StartSend, Stream,
+use futures::compat::Compat;
+use futures01::{
+    future, stream::FuturesUnordered, Async, AsyncSink, Future, Poll, Sink, StartSend, Stream,
 };
 use rdkafka::{
     consumer::{BaseConsumer, Consumer},
     producer::{DeliveryFuture, FutureProducer, FutureRecord},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use snafu::{ResultExt, Snafu};
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use string_cache::DefaultAtom as Atom;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct KafkaSinkConfig {
-    bootstrap_servers: Vec<String>,
-    topic: String,
-    key_field: Option<Atom>,
-    encoding: Option<Encoding>,
+type MetadataFuture<F, M> = future::Join<F, future::FutureResult<M, <F as Future>::Error>>;
+
+#[derive(Debug, Snafu)]
+enum BuildError {
+    #[snafu(display("creating kafka producer failed: {}", source))]
+    KafkaCreateFailed { source: rdkafka::error::KafkaError },
 }
 
-#[derive(Deserialize, Serialize, Debug, Eq, PartialEq, Clone)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct KafkaSinkConfig {
+    bootstrap_servers: String,
+    topic: String,
+    key_field: Option<Atom>,
+    encoding: EncodingConfigWithDefault<Encoding>,
+    compression: Option<KafkaCompression>,
+    tls: Option<KafkaTlsConfig>,
+    #[serde(default = "default_socket_timeout_ms")]
+    socket_timeout_ms: u64,
+    #[serde(default = "default_message_timeout_ms")]
+    message_timeout_ms: u64,
+    librdkafka_options: Option<HashMap<String, String>>,
+}
+
+fn default_socket_timeout_ms() -> u64 {
+    60000 // default in librdkafka
+}
+
+fn default_message_timeout_ms() -> u64 {
+    300000 // default in librdkafka
+}
+
+#[derive(Clone, Copy, Debug, Derivative, Deserialize, Serialize, Eq, PartialEq)]
+#[derivative(Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Encoding {
+    #[derivative(Default)]
     Text,
     Json,
 }
@@ -37,8 +64,8 @@ pub struct KafkaSink {
     producer: FutureProducer,
     topic: String,
     key_field: Option<Atom>,
-    encoding: Option<Encoding>,
-    in_flight: FuturesUnordered<MetadataFuture<DeliveryFuture, usize>>,
+    encoding: EncodingConfig<Encoding>,
+    in_flight: FuturesUnordered<MetadataFuture<Compat<DeliveryFuture>, usize>>,
 
     acker: Acker,
     seq_head: usize,
@@ -46,10 +73,14 @@ pub struct KafkaSink {
     pending_acks: HashSet<usize>,
 }
 
+inventory::submit! {
+    SinkDescription::new_without_default::<KafkaSinkConfig>("kafka")
+}
+
 #[typetag::serde(name = "kafka")]
 impl SinkConfig for KafkaSinkConfig {
-    fn build(&self, acker: Acker) -> Result<(super::RouterSink, super::Healthcheck), String> {
-        let sink = KafkaSink::new(self.clone(), acker)?;
+    fn build(&self, cx: SinkContext) -> crate::Result<(super::RouterSink, super::Healthcheck)> {
+        let sink = KafkaSink::new(self.clone(), cx.acker())?;
         let hc = healthcheck(self.clone());
         Ok((Box::new(sink), hc))
     }
@@ -57,34 +88,48 @@ impl SinkConfig for KafkaSinkConfig {
     fn input_type(&self) -> DataType {
         DataType::Log
     }
+
+    fn sink_type(&self) -> &'static str {
+        "kafka"
+    }
 }
 
 impl KafkaSinkConfig {
-    fn to_rdkafka(&self) -> rdkafka::ClientConfig {
+    fn to_rdkafka(&self) -> crate::Result<rdkafka::ClientConfig> {
         let mut client_config = rdkafka::ClientConfig::new();
-        let bs = self.bootstrap_servers.join(",");
-        client_config.set("bootstrap.servers", &bs);
-        client_config
+        client_config.set("bootstrap.servers", &self.bootstrap_servers);
+        if let Some(tls) = &self.tls {
+            tls.apply(&mut client_config)?;
+        }
+        client_config.set(
+            "compression.codec",
+            &to_string(self.compression.unwrap_or_default()),
+        );
+        client_config.set("socket.timeout.ms", &self.socket_timeout_ms.to_string());
+        client_config.set("message.timeout.ms", &self.message_timeout_ms.to_string());
+        if let Some(ref librdkafka_options) = self.librdkafka_options {
+            for (key, value) in librdkafka_options.iter() {
+                client_config.set(key.as_str(), value.as_str());
+            }
+        }
+        Ok(client_config)
     }
 }
 
 impl KafkaSink {
-    fn new(config: KafkaSinkConfig, acker: Acker) -> Result<Self, String> {
-        config
-            .to_rdkafka()
-            .create()
-            .map_err(|e| format!("error creating kafka producer: {}", e))
-            .map(|producer| KafkaSink {
-                producer,
-                topic: config.topic,
-                key_field: config.key_field,
-                encoding: config.encoding,
-                in_flight: FuturesUnordered::new(),
-                acker,
-                seq_head: 0,
-                seq_tail: 0,
-                pending_acks: HashSet::new(),
-            })
+    fn new(config: KafkaSinkConfig, acker: Acker) -> crate::Result<Self> {
+        let producer = config.to_rdkafka()?.create().context(KafkaCreateFailed)?;
+        Ok(KafkaSink {
+            producer,
+            topic: config.topic,
+            key_field: config.key_field,
+            encoding: config.encoding.into(),
+            in_flight: FuturesUnordered::new(),
+            acker,
+            seq_head: 0,
+            seq_tail: 0,
+            pending_acks: HashSet::new(),
+        })
     }
 }
 
@@ -95,7 +140,7 @@ impl Sink for KafkaSink {
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
         let topic = self.topic.clone();
 
-        let (key, body) = encode_event(&item, &self.key_field, &self.encoding);
+        let (key, body) = encode_event(item.clone(), &self.key_field, &self.encoding);
 
         let record = FutureRecord::to(&topic).key(&key).payload(&body[..]);
 
@@ -121,7 +166,8 @@ impl Sink for KafkaSink {
         let seqno = self.seq_head;
         self.seq_head += 1;
 
-        self.in_flight.push(future.join(future::ok(seqno)));
+        self.in_flight
+            .push(Compat::new(future).join(future::ok(seqno)));
         Ok(AsyncSink::Ready)
     }
 
@@ -163,42 +209,39 @@ impl Sink for KafkaSink {
 }
 
 fn healthcheck(config: KafkaSinkConfig) -> super::Healthcheck {
-    let consumer: BaseConsumer = config.to_rdkafka().create().unwrap();
+    let consumer: BaseConsumer = config.to_rdkafka().unwrap().create().unwrap();
 
-    let check = poll_fn(move || {
-        tokio_threadpool::blocking(|| {
+    let check = future::lazy(move || {
+        tokio::task::block_in_place(|| {
             consumer
                 .fetch_metadata(Some(&config.topic), Duration::from_secs(3))
                 .map(|_| ())
-                .map_err(|e| e.to_string())
+                .map_err(|err| err.into())
         })
-    })
-    .map_err(|e| e.to_string())
-    .and_then(|result| result.into_future());
+    });
 
     Box::new(check)
 }
 
 fn encode_event(
-    event: &Event,
+    mut event: Event,
     key_field: &Option<Atom>,
-    encoding: &Option<Encoding>,
+    encoding: &EncodingConfig<Encoding>,
 ) -> (Vec<u8>, Vec<u8>) {
+    encoding.apply_rules(&mut event);
     let key = key_field
         .as_ref()
         .and_then(|f| event.as_log().get(f))
         .map(|v| v.as_bytes().to_vec())
-        .unwrap_or(Vec::new());
+        .unwrap_or_default();
 
-    let body = match (encoding, event.as_log().is_structured()) {
-        (&Some(Encoding::Json), _) | (_, true) => {
-            serde_json::to_vec(&event.as_log().clone().unflatten()).unwrap()
-        }
-        (&Some(Encoding::Text), _) | (_, false) => event
+    let body = match encoding.codec {
+        Encoding::Json => serde_json::to_vec(&event.as_log()).unwrap(),
+        Encoding::Text => event
             .as_log()
-            .get(&event::MESSAGE)
+            .get(&event::log_schema().message_key())
             .map(|v| v.as_bytes().to_vec())
-            .unwrap_or(Vec::new()),
+            .unwrap_or_default(),
     };
 
     (key, body)
@@ -208,35 +251,39 @@ fn encode_event(
 mod tests {
     use super::*;
     use crate::event::{self, Event};
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     #[test]
-    fn kafka_encode_event_non_structured() {
+    fn kafka_encode_event_text() {
         let key = "";
         let message = "hello world".to_string();
-        let (key_bytes, bytes) = encode_event(&message.clone().into(), &None, &None);
+        let (key_bytes, bytes) = encode_event(
+            message.clone().into(),
+            &None,
+            &EncodingConfig::from(Encoding::Text),
+        );
 
         assert_eq!(&key_bytes[..], key.as_bytes());
         assert_eq!(&bytes[..], message.as_bytes());
     }
 
     #[test]
-    fn kafka_encode_event_structured() {
+    fn kafka_encode_event_json() {
         let message = "hello world".to_string();
         let mut event = Event::from(message.clone());
-        event
-            .as_mut_log()
-            .insert_explicit("key".into(), "value".into());
-        event
-            .as_mut_log()
-            .insert_explicit("foo".into(), "bar".into());
+        event.as_mut_log().insert("key", "value");
+        event.as_mut_log().insert("foo", "bar");
 
-        let (key, bytes) = encode_event(&event, &Some("key".into()), &None);
+        let (key, bytes) = encode_event(
+            event,
+            &Some("key".into()),
+            &EncodingConfig::from(Encoding::Json),
+        );
 
-        let map: HashMap<String, String> = serde_json::from_slice(&bytes[..]).unwrap();
+        let map: BTreeMap<String, String> = serde_json::from_slice(&bytes[..]).unwrap();
 
         assert_eq!(&key[..], "value".as_bytes());
-        assert_eq!(map[&event::MESSAGE.to_string()], message);
+        assert_eq!(map[&event::log_schema().message_key().to_string()], message);
         assert_eq!(map["key"], "value".to_string());
         assert_eq!(map["foo"], "bar".to_string());
     }
@@ -245,10 +292,14 @@ mod tests {
 #[cfg(feature = "kafka-integration-tests")]
 #[cfg(test)]
 mod integration_test {
-    use super::{KafkaSink, KafkaSinkConfig};
-    use crate::buffers::Acker;
-    use crate::test_util::{block_on, random_lines_with_stream, random_string, wait_for};
-    use futures::Sink;
+    use super::*;
+    use crate::{
+        buffers::Acker,
+        kafka::KafkaTlsConfig,
+        test_util::{block_on, random_lines_with_stream, random_string, wait_for},
+        tls::TlsOptions,
+    };
+    use futures01::Sink;
     use rdkafka::{
         consumer::{BaseConsumer, Consumer},
         Message, Offset, TopicPartitionList,
@@ -256,15 +307,88 @@ mod integration_test {
     use std::{thread, time::Duration};
 
     #[test]
-    fn kafka_happy_path() {
-        let bootstrap_servers = vec![String::from("localhost:9092")];
+    fn kafka_happy_path_plaintext() {
+        kafka_happy_path("localhost:9092", None, None);
+    }
+
+    #[test]
+    fn healthcheck() {
         let topic = format!("test-{}", random_string(10));
 
         let config = KafkaSinkConfig {
-            bootstrap_servers: bootstrap_servers.clone(),
+            bootstrap_servers: "localhost:9092".into(),
             topic: topic.clone(),
+            compression: None,
+            encoding: EncodingConfigWithDefault::from(Encoding::Text),
             key_field: None,
-            encoding: None,
+            tls: None,
+            socket_timeout_ms: 60000,
+            message_timeout_ms: 300000,
+            ..Default::default()
+        };
+
+        let mut rt = crate::test_util::runtime();
+        use futures::compat::Future01CompatExt;
+        let jh = rt.spawn_handle(super::healthcheck(config).compat());
+
+        rt.block_on_std(jh).unwrap().unwrap();
+    }
+
+    const TEST_CA: &str = "tests/data/Vector_CA.crt";
+
+    #[test]
+    fn kafka_happy_path_tls() {
+        kafka_happy_path(
+            "localhost:9091",
+            Some(KafkaTlsConfig {
+                enabled: Some(true),
+                options: TlsOptions {
+                    ca_path: Some(TEST_CA.into()),
+                    ..Default::default()
+                },
+            }),
+            None,
+        );
+    }
+
+    #[test]
+    fn kafka_happy_path_gzip() {
+        kafka_happy_path("localhost:9092", None, Some(KafkaCompression::Gzip));
+    }
+
+    #[test]
+    fn kafka_happy_path_lz4() {
+        kafka_happy_path("localhost:9092", None, Some(KafkaCompression::Lz4));
+    }
+
+    #[test]
+    fn kafka_happy_path_snappy() {
+        kafka_happy_path("localhost:9092", None, Some(KafkaCompression::Snappy));
+    }
+
+    #[test]
+    fn kafka_happy_path_zstd() {
+        kafka_happy_path("localhost:9092", None, Some(KafkaCompression::Zstd));
+    }
+
+    fn kafka_happy_path(
+        server: &str,
+        tls: Option<KafkaTlsConfig>,
+        compression: Option<KafkaCompression>,
+    ) {
+        let topic = format!("test-{}", random_string(10));
+
+        let tls_enabled = tls.as_ref().map(|tls| tls.enabled()).unwrap_or(false);
+        let config = KafkaSinkConfig {
+            bootstrap_servers: server.to_string(),
+            topic: topic.clone(),
+            compression,
+            encoding: EncodingConfigWithDefault::from(Encoding::Text),
+            key_field: None,
+            tls,
+            socket_timeout_ms: 60000,
+            message_timeout_ms: 300000,
+            ..Default::default()
         };
         let (acker, ack_counter) = Acker::new_for_testing();
         let sink = KafkaSink::new(config, acker).unwrap();
@@ -273,14 +397,17 @@ mod integration_test {
         let (input, events) = random_lines_with_stream(100, num_events);
 
         let pump = sink.send_all(events);
-        block_on(pump).unwrap();
+        let _ = block_on(pump).unwrap();
 
         // read back everything from the beginning
         let mut client_config = rdkafka::ClientConfig::new();
-        let bs = bootstrap_servers.join(",");
-        client_config.set("bootstrap.servers", &bs);
+        client_config.set("bootstrap.servers", server);
         client_config.set("group.id", &random_string(10));
         client_config.set("enable.partition.eof", "true");
+        if tls_enabled {
+            client_config.set("security.protocol", "ssl");
+            client_config.set("ssl.ca.location", TEST_CA);
+        }
 
         let mut tpl = TopicPartitionList::new();
         tpl.add_partition(&topic, 0).set_offset(Offset::Beginning);

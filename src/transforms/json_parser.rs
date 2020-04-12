@@ -1,7 +1,7 @@
 use super::Transform;
 use crate::{
-    event::{self, Event, ValueKind},
-    topology::config::{DataType, TransformConfig},
+    event::{self, Event},
+    topology::config::{DataType, TransformConfig, TransformContext, TransformDescription},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,11 +15,17 @@ pub struct JsonParserConfig {
     pub drop_invalid: bool,
     #[derivative(Default(value = "true"))]
     pub drop_field: bool,
+    pub target_field: Option<String>,
+    pub overwrite_target: Option<bool>,
+}
+
+inventory::submit! {
+    TransformDescription::new::<JsonParserConfig>("json_parser")
 }
 
 #[typetag::serde(name = "json_parser")]
 impl TransformConfig for JsonParserConfig {
-    fn build(&self) -> Result<Box<dyn Transform>, String> {
+    fn build(&self, _cx: TransformContext) -> crate::Result<Box<dyn Transform>> {
         Ok(Box::new(JsonParser::from(self.clone())))
     }
 
@@ -30,12 +36,19 @@ impl TransformConfig for JsonParserConfig {
     fn output_type(&self) -> DataType {
         DataType::Log
     }
+
+    fn transform_type(&self) -> &'static str {
+        "json_parser"
+    }
 }
 
+#[derive(Debug)]
 pub struct JsonParser {
     field: Atom,
     drop_invalid: bool,
     drop_field: bool,
+    target_field: Option<Atom>,
+    overwrite_target: bool,
 }
 
 impl From<JsonParserConfig> for JsonParser {
@@ -43,20 +56,23 @@ impl From<JsonParserConfig> for JsonParser {
         let field = if let Some(field) = &config.field {
             field
         } else {
-            &event::MESSAGE
+            &event::log_schema().message_key()
         };
 
         JsonParser {
             field: field.clone(),
             drop_invalid: config.drop_invalid,
             drop_field: config.drop_field,
+            target_field: config.target_field.map(Atom::from),
+            overwrite_target: config.overwrite_target.unwrap_or(false),
         }
     }
 }
 
 impl Transform for JsonParser {
     fn transform(&mut self, mut event: Event) -> Option<Event> {
-        let to_parse = event.as_log().get(&self.field).map(|s| s.as_bytes());
+        let log = event.as_mut_log();
+        let to_parse = log.get(&self.field).map(|s| s.as_bytes());
 
         let parsed = to_parse
             .and_then(|to_parse| {
@@ -66,6 +82,7 @@ impl Transform for JsonParser {
                             message = "Event failed to parse as JSON",
                             field = self.field.as_ref(),
                             %error,
+                            rate_limit_secs = 30
                         )
                     })
                     .ok()
@@ -79,59 +96,35 @@ impl Transform for JsonParser {
             });
 
         if let Some(object) = parsed {
-            for (name, value) in object {
-                insert(&mut event, name, value);
-            }
-        } else {
-            if self.drop_invalid {
-                return None;
-            }
-        }
+            match self.target_field {
+                Some(ref target_field) => {
+                    let contains_target = log.contains(&target_field);
 
-        if self.drop_field {
-            event.as_mut_log().remove(&self.field);
+                    if contains_target && !self.overwrite_target {
+                        error!(message = "target field already exists", %target_field);
+                    } else {
+                        if self.drop_field {
+                            log.remove(&self.field);
+                        }
+
+                        log.insert(&target_field, Value::Object(object));
+                    }
+                }
+                None => {
+                    if self.drop_field {
+                        log.remove(&self.field);
+                    }
+
+                    for (key, value) in object {
+                        log.insert(key, value);
+                    }
+                }
+            }
+        } else if self.drop_invalid {
+            return None;
         }
 
         Some(event)
-    }
-}
-
-fn insert(event: &mut Event, name: String, value: Value) {
-    match value {
-        Value::String(string) => {
-            event
-                .as_mut_log()
-                .insert_explicit(name.into(), string.into());
-        }
-        Value::Number(number) => {
-            let val = if let Some(val) = number.as_i64() {
-                ValueKind::from(val)
-            } else if let Some(val) = number.as_f64() {
-                ValueKind::from(val)
-            } else {
-                ValueKind::from(number.to_string())
-            };
-
-            event.as_mut_log().insert_explicit(name.into(), val);
-        }
-        Value::Bool(b) => {
-            event.as_mut_log().insert_explicit(name.into(), b.into());
-        }
-        Value::Null => {
-            event.as_mut_log().insert_explicit(name.into(), "".into());
-        }
-        Value::Array(array) => {
-            for (i, element) in array.into_iter().enumerate() {
-                let element_name = format!("{}[{}]", name, i);
-                insert(event, element_name, element);
-            }
-        }
-        Value::Object(object) => {
-            for (key, value) in object.into_iter() {
-                let item_name = format!("{}.{}", name, key);
-                insert(event, item_name, value);
-            }
-        }
     }
 }
 
@@ -150,7 +143,10 @@ mod test {
 
         let event = parser.transform(event).unwrap();
 
-        assert!(event.as_log().get(&event::MESSAGE).is_none());
+        assert!(event
+            .as_log()
+            .get(&event::log_schema().message_key())
+            .is_none());
     }
 
     #[test]
@@ -164,7 +160,10 @@ mod test {
 
         let event = parser.transform(event).unwrap();
 
-        assert!(event.as_log().get(&event::MESSAGE).is_some());
+        assert!(event
+            .as_log()
+            .get(&event::log_schema().message_key())
+            .is_some());
     }
 
     #[test]
@@ -181,8 +180,27 @@ mod test {
         assert_eq!(event.as_log()[&Atom::from("greeting")], "hello".into());
         assert_eq!(event.as_log()[&Atom::from("name")], "bob".into());
         assert_eq!(
-            event.as_log()[&event::MESSAGE],
+            event.as_log()[&event::log_schema().message_key()],
             r#"{"greeting": "hello", "name": "bob"}"#.into()
+        );
+    }
+
+    #[test]
+    fn json_parser_parse_raw_with_whitespace() {
+        let mut parser = JsonParser::from(JsonParserConfig {
+            drop_field: false,
+            ..Default::default()
+        });
+
+        let event = Event::from(r#" {"greeting": "hello", "name": "bob"}    "#);
+
+        let event = parser.transform(event).unwrap();
+
+        assert_eq!(event.as_log()[&Atom::from("greeting")], "hello".into());
+        assert_eq!(event.as_log()[&Atom::from("name")], "bob".into());
+        assert_eq!(
+            event.as_log()[&event::log_schema().message_key()],
+            r#" {"greeting": "hello", "name": "bob"}    "#.into()
         );
     }
 
@@ -197,10 +215,9 @@ mod test {
         // Field present
 
         let mut event = Event::from("message");
-        event.as_mut_log().insert_explicit(
-            "data".into(),
-            r#"{"greeting": "hello", "name": "bob"}"#.into(),
-        );
+        event
+            .as_mut_log()
+            .insert("data", r#"{"greeting": "hello", "name": "bob"}"#);
 
         let event = parser.transform(event).unwrap();
 
@@ -230,7 +247,9 @@ mod test {
             ..Default::default()
         });
 
-        let event = Event::from(r#"{"log":"{\"type\":\"response\",\"@timestamp\":\"2018-10-04T21:12:33Z\",\"tags\":[],\"pid\":1,\"method\":\"post\",\"statusCode\":200,\"req\":{\"url\":\"/elasticsearch/_msearch\",\"method\":\"post\",\"headers\":{\"host\":\"logs.com\",\"connection\":\"close\",\"x-real-ip\":\"120.21.3.1\",\"x-forwarded-for\":\"121.91.2.2\",\"x-forwarded-host\":\"logs.com\",\"x-forwarded-port\":\"443\",\"x-forwarded-proto\":\"https\",\"x-original-uri\":\"/elasticsearch/_msearch\",\"x-scheme\":\"https\",\"content-length\":\"1026\",\"accept\":\"application/json, text/plain, */*\",\"origin\":\"https://logs.com\",\"kbn-version\":\"5.2.3\",\"user-agent\":\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/532.30 (KHTML, like Gecko) Chrome/62.0.3361.210 Safari/533.21\",\"content-type\":\"application/x-ndjson\",\"referer\":\"https://domain.com/app/kibana\",\"accept-encoding\":\"gzip, deflate, br\",\"accept-language\":\"en-US,en;q=0.8\"},\"remoteAddress\":\"122.211.22.11\",\"userAgent\":\"22.322.32.22\",\"referer\":\"https://domain.com/app/kibana\"},\"res\":{\"statusCode\":200,\"responseTime\":417,\"contentLength\":9},\"message\":\"POST /elasticsearch/_msearch 200 225ms - 8.0B\"}\n","stream":"stdout","time":"2018-10-02T21:14:48.2233245241Z"}"#);
+        let event = Event::from(
+            r#"{"log":"{\"type\":\"response\",\"@timestamp\":\"2018-10-04T21:12:33Z\",\"tags\":[],\"pid\":1,\"method\":\"post\",\"statusCode\":200,\"req\":{\"url\":\"/elasticsearch/_msearch\",\"method\":\"post\",\"headers\":{\"host\":\"logs.com\",\"connection\":\"close\",\"x-real-ip\":\"120.21.3.1\",\"x-forwarded-for\":\"121.91.2.2\",\"x-forwarded-host\":\"logs.com\",\"x-forwarded-port\":\"443\",\"x-forwarded-proto\":\"https\",\"x-original-uri\":\"/elasticsearch/_msearch\",\"x-scheme\":\"https\",\"content-length\":\"1026\",\"accept\":\"application/json, text/plain, */*\",\"origin\":\"https://logs.com\",\"kbn-version\":\"5.2.3\",\"user-agent\":\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/532.30 (KHTML, like Gecko) Chrome/62.0.3361.210 Safari/533.21\",\"content-type\":\"application/x-ndjson\",\"referer\":\"https://domain.com/app/kibana\",\"accept-encoding\":\"gzip, deflate, br\",\"accept-language\":\"en-US,en;q=0.8\"},\"remoteAddress\":\"122.211.22.11\",\"userAgent\":\"22.322.32.22\",\"referer\":\"https://domain.com/app/kibana\"},\"res\":{\"statusCode\":200,\"responseTime\":417,\"contentLength\":9},\"message\":\"POST /elasticsearch/_msearch 200 225ms - 8.0B\"}\n","stream":"stdout","time":"2018-10-02T21:14:48.2233245241Z"}"#,
+        );
 
         let parsed_event = parser_outter.transform(event).unwrap();
 
@@ -261,7 +280,10 @@ mod test {
         let parsed = parser.transform(event.clone()).unwrap();
 
         assert_eq!(event, parsed);
-        assert_eq!(event.as_log()[&event::MESSAGE], invalid.into());
+        assert_eq!(
+            event.as_log()[&event::log_schema().message_key()],
+            invalid.into()
+        );
 
         // Field
         let mut parser = JsonParser::from(JsonParserConfig {
@@ -271,9 +293,7 @@ mod test {
         });
 
         let mut event = Event::from("message");
-        event
-            .as_mut_log()
-            .insert_explicit("data".into(), invalid.into());
+        event.as_mut_log().insert("data", invalid);
 
         let event = parser.transform(event).unwrap();
 
@@ -310,21 +330,15 @@ mod test {
         });
 
         let mut event = Event::from("message");
-        event
-            .as_mut_log()
-            .insert_explicit("data".into(), valid.into());
+        event.as_mut_log().insert("data", valid);
         assert!(parser.transform(event).is_some());
 
         let mut event = Event::from("message");
-        event
-            .as_mut_log()
-            .insert_explicit("data".into(), invalid.into());
+        event.as_mut_log().insert("data", invalid);
         assert!(parser.transform(event).is_none());
 
         let mut event = Event::from("message");
-        event
-            .as_mut_log()
-            .insert_explicit("data".into(), not_object.into());
+        event.as_mut_log().insert("data", not_object);
         assert!(parser.transform(event).is_none());
 
         // Missing field
@@ -342,7 +356,9 @@ mod test {
             ..Default::default()
         });
 
-        let event = Event::from(r#"{"greeting": "hello", "name": "bob", "nested": "{\"message\": \"help i'm trapped under many layers of json\"}"}"#);
+        let event = Event::from(
+            r#"{"greeting": "hello", "name": "bob", "nested": "{\"message\": \"help i'm trapped under many layers of json\"}"}"#,
+        );
         let event = parser1.transform(event).unwrap();
         let event = parser2.transform(event).unwrap();
 
@@ -376,7 +392,10 @@ mod test {
         let event = parser.transform(event).unwrap();
 
         assert_eq!(event.as_log()[&Atom::from("string")], "this is text".into());
-        assert_eq!(event.as_log()[&Atom::from("null")], "".into());
+        assert_eq!(
+            event.as_log()[&Atom::from("null")],
+            crate::event::Value::Null
+        );
         assert_eq!(event.as_log()[&Atom::from("float")], 12.34.into());
         assert_eq!(event.as_log()[&Atom::from("int")], 56.into());
         assert_eq!(event.as_log()[&Atom::from("bool true")], true.into());
@@ -389,5 +408,98 @@ mod test {
             event.as_log()[&Atom::from("deep[0][0][0].a.b.c[0][0][0]")],
             1234.into()
         );
+    }
+
+    #[test]
+    fn drop_field_before_adding() {
+        let mut parser = JsonParser::from(JsonParserConfig {
+            drop_field: true,
+            ..Default::default()
+        });
+
+        let event = Event::from(
+            r#"{
+                "key": "data",
+                "message": "inner"
+            }"#,
+        );
+
+        let event = parser.transform(event).unwrap();
+
+        assert_eq!(event.as_log()[&Atom::from("key")], "data".into());
+        assert_eq!(event.as_log()[&Atom::from("message")], "inner".into());
+    }
+
+    #[test]
+    fn doesnt_drop_field_after_failed_parse() {
+        let mut parser = JsonParser::from(JsonParserConfig {
+            drop_field: true,
+            ..Default::default()
+        });
+
+        let event = Event::from(r#"invalid json"#);
+
+        let event = parser.transform(event).unwrap();
+
+        assert_eq!(
+            event.as_log()[&Atom::from("message")],
+            "invalid json".into()
+        );
+    }
+
+    #[test]
+    fn target_field_works() {
+        let mut parser = JsonParser::from(JsonParserConfig {
+            drop_field: false,
+            target_field: Some("that".into()),
+            ..Default::default()
+        });
+
+        let event = Event::from(r#"{"greeting": "hello", "name": "bob"}"#);
+        let event = parser.transform(event).unwrap();
+        let event = event.as_log();
+
+        assert_eq!(event[&Atom::from("that.greeting")], "hello".into());
+        assert_eq!(event[&Atom::from("that.name")], "bob".into());
+    }
+
+    #[test]
+    fn target_field_preserves_existing() {
+        let mut parser = JsonParser::from(JsonParserConfig {
+            drop_field: false,
+            target_field: Some("message".into()),
+            ..Default::default()
+        });
+
+        let message = r#"{"greeting": "hello", "name": "bob"}"#;
+        let event = Event::from(message);
+        let event = parser.transform(event).unwrap();
+        let event = event.as_log();
+
+        assert_eq!(event[&"message".into()], message.into());
+        assert_eq!(event.get(&"message.greeting".into()), None);
+        assert_eq!(event.get(&"message.name".into()), None);
+    }
+
+    #[test]
+    fn target_field_overwrites_existing() {
+        let mut parser = JsonParser::from(JsonParserConfig {
+            drop_field: false,
+            target_field: Some("message".into()),
+            overwrite_target: Some(true),
+            ..Default::default()
+        });
+
+        let message = r#"{"greeting": "hello", "name": "bob"}"#;
+        let event = Event::from(message);
+        let event = parser.transform(event).unwrap();
+        let event = event.as_log();
+
+        match event.get(&"message".into()) {
+            Some(crate::event::Value::Map(_)) => (),
+            _ => panic!("\"message\" is not a map"),
+        }
+        assert_eq!(event[&Atom::from("message.greeting")], "hello".into());
+        assert_eq!(event[&Atom::from("message.name")], "bob".into());
     }
 }

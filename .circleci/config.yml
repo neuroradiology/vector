@@ -1,22 +1,53 @@
 #
-# Run macros
+# Job Macros
 #
+
+docker-machine: &docker-machine
+  machine:
+    image: ubuntu-1604:201903-01
+    docker_layer_caching: true
+  resource_class: large
 
 install-rust: &install-rust
   run:
     name: Install Rust
     command: |
-      curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+      curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+
+install-rust-windows: &install-rust-windows
+  run:
+    name: Install Rust
+    shell: bash
+    command: |
+      curl https://sh.rustup.rs -sSf | sh -s -- -y \
+        --profile minimal \
+        --default-toolchain stable \
+        --default-host x86_64-pc-windows-msvc
+      # see https://github.com/rust-lang/cargo/issues/2078
+      printf '[net]\ngit-fetch-with-cli = true\n' > "$HOME/.cargo/config"
+
+install-vector: &install-vector
+  run:
+    name: Execute install.sh
+    command: HOMEBREW_NO_AUTO_UPDATE=1 distribution/install.sh -y
 
 restore-artifacts-from-workspace: &restore-artifacts-from-workspace
   attach_workspace:
     at: target/artifacts
 
+test-install-script: &test-install-script
+  run:
+    name: Verify installation
+    command: vector --version
+
 #
 # Main document
 #
 
-version: 2
+version: 2.1
+
+orbs:
+  win: circleci/windows@1.0.0
 
 jobs:
   #
@@ -24,114 +55,167 @@ jobs:
   #
 
   check-code:
-    resource_class: xlarge
-    docker:
-      - image: timberiodev/vector-checker:latest
+    <<: *docker-machine
     steps:
       - checkout
       - run:
-          name: Check code
+          name: Check generate
           environment:
-            RUSTFLAGS: "-D warnings"
+            PASS_RUSTFLAGS: "-D warnings"
           command: make check-code
 
   check-fmt:
-    docker:
-      - image: timberiodev/vector-checker:latest
+    <<: *docker-machine
     steps:
       - checkout
       - run:
           name: Check fmt
           environment:
-            RUSTFLAGS: "-D warnings"
-          command: |
-            rustup component add rustfmt
-            make check-fmt
+            PASS_RUSTFLAGS: "-D warnings"
+          command: make check-fmt
 
   check-generate:
-    docker:
-      - image: timberiodev/vector-checker:latest
+    <<: *docker-machine
     steps:
       - checkout
       - run:
           name: Check generate
           command: make check-generate
 
-  test-stable:
-    resource_class: xlarge
-    docker:
-      - image: rust:latest
-        environment:
-          RUST_BACKTRACE: full
-          AWS_ACCESS_KEY_ID: "fake-aws-key"
-          AWS_SECRET_ACCESS_KEY: "fake-aws-key"
-      - image: localstack/localstack@sha256:f21f1fc770ee4bfd5012afdc902154c56b7fb18c14cf672de151b65569c8251e
-        environment:
-          DATA_DIR: /tmp/localstack/data
-          DEBUG: 1
-          PORT_WEB_UI: 8888
-          SERVICES: kinesis,cloudwatch
-      - image: minio/minio
-        environment:
-          MINIO_ACCESS_KEY: "test-access-key"
-          MINIO_SECRET_KEY: "test-secret-key"
-        command: server /tmp
-      - image: luciofranco/mockwatchlogs:latest
-      - image: spotify/kafka
-        environment:
-          ADVERTISED_HOST: localhost
-          ADVERTISED_PORT: 9092
-      - image: timberio/splunk-hec-test:latest
-      - image: elasticsearch:6.6.2
-        environment:
-          - discovery.type=single-node
-      - image: yandex/clickhouse-server:19
+  check-version:
+    <<: *docker-machine
     steps:
       - checkout
       - run:
-          name: Test
-          command: cargo test --all --features docker -- --test-threads 4
+          name: Check version
+          command: make check-version
+
+  check-blog:
+    <<: *docker-machine
+    steps:
+      - checkout
+      - run:
+          name: Check blog
+          command: make check-blog
+
+  test-x86_64-pc-windows-msvc:
+    executor: win/vs2019
+    steps:
+      - checkout
+      - *install-rust-windows
+      - run:
+          name: Download Perl
+          shell: bash
+          command: |
+            VERSION=5.30.0.1
+            # we need to verify checksum because strawberryperl.com doesn't support HTTPS
+            SHA256SUM=459de13a284a4c83213208c9caa1c372c81136b6e863a3f13d42f631048e0b12
+            curl -sSf http://strawberryperl.com/download/$VERSION/strawberry-perl-$VERSION-64bit.msi > perl-installer.msi
+            echo "$SHA256SUM perl-installer.msi" | sha256sum --check --status
+      - run:
+          name: Install Perl
+          shell: cmd.exe # msiexec fails when called from bash
+          command: |
+            msiexec /quiet /i perl-installer.msi
+            del perl-installer.msi
+      - run:
+          name: Download CMake
+          shell: bash
+          command: |
+            VERSION=3.15.5
+            curl -sSfL https://github.com/Kitware/CMake/releases/download/v$VERSION/cmake-$VERSION-win64-x64.msi > cmake-installer.msi
+      - run:
+          name: Install CMake
+          shell: cmd.exe # msiexec fails when called from bash
+          command: |
+            msiexec /quiet /i cmake-installer.msi
+            del cmake-installer.msi
+      - run:
+          name: Build and test
+          shell: bash
+          no_output_timeout: 30m
+          environment:
+            RUSTFLAGS: -Ctarget-feature=+crt-static
+            RUST_BACKTRACE: full
+          command: |
+            PATH="$HOME/.cargo/bin:/c/Strawberry/perl/bin:/c/Program Files/CMake/bin:$PATH"
+            cargo test --release --no-default-features --features default-msvc -- --test-threads 1
+
+  test-stable-kubernetes:
+    machine: true
+    resource_class: xlarge
+    environment:
+      K8S_VERSION: v1.10.0
+      KUBECONFIG: /home/circleci/.kube/config
+      MINIKUBE_VERSION: v0.30.0
+      MINIKUBE_WANTUPDATENOTIFICATION: false
+      MINIKUBE_WANTREPORTERRORPROMPT: false
+      MINIKUBE_HOME: /home/circleci
+      CHANGE_MINIKUBE_NONE_USER: true
+    steps:
+      - checkout
+      - run:
+          name: setup kubectl
+          command: |
+            curl -Lo kubectl https://storage.googleapis.com/kubernetes-release/release/${K8S_VERSION}/bin/linux/amd64/kubectl && chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+            mkdir -p ${HOME}/.kube
+            touch ${HOME}/.kube/config
+      - run:
+          name: Start Kubernetes
+          command: |
+            docker run -d --name kube --privileged -p 8443:8443 -p 10080:10080 bsycorp/kind:latest-1.14
+            until curl -s --fail http://127.0.0.1:10080/kubernetes-ready; do
+              sleep 1;
+            done
+            curl http://127.0.0.1:10080/config > ~/.kube/config
+            echo "Kubernetes ready - run tests!"
+      - run:
+          command: |
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain none
+            source $HOME/.cargo/env
+            rustup set profile minimal
+            rustup install stable
+            rustup default stable
+
+      - run:
+          name: Run tests
+          command: |
+            export PATH=$PATH:$HOME/.cargo/bin
+            cargo test kubernetes --no-default-features --features kubernetes-integration-tests
+
+
+  test-stable:
+    <<: *docker-machine
+    environment:
+      RUST_BACKTRACE: full
+      TEST_LOG: debug
+      AWS_ACCESS_KEY_ID: fake-aws-key
+      AWS_SECRET_ACCESS_KEY: fake-aws-key
+      TARGET: x86_64-unknown-linux-musl
+    steps:
+      - checkout
+      - run:
+          name: Build tests
+          command: |
+            ./scripts/docker-run.sh builder-$TARGET cargo test --all --no-default-features --features default-musl,docker --no-run --target $TARGET
+      - run:
+          name: Start dependencies
+          command: |
+            docker-compose pull
+            docker-compose up -d splunk
+            sleep 30 # Splunk crashes when started simultaneously with other services
+            docker-compose up -d test-runtime-deps
+            sleep 180
+      - run:
+          name: Run tests
+          command: |
+            find ./target/$TARGET -maxdepth 2 -type f -executable -name '*-*' | sh -e
       - store_test_results:
           path: ./test-results
 
   #
-  # Building - Archives
+  # Building
   #
-
-  build-armv7-unknown-linux-gnueabihf-archive:
-    docker:
-      - image: timberiodev/vector-builder-armv7-unknown-linux-gnueabihf:latest
-    resource_class: xlarge
-    steps:
-      - checkout
-      - run:
-          name: Build archive
-          command: |
-            export VERSION=$(make version)
-            export FEATURES="jemallocator"
-            export STRIP=false
-            make build-archive
-      - persist_to_workspace:
-          root: target/artifacts
-          paths:
-            - "*-armv7-unknown-linux-gnueabihf.tar.gz"
-
-  # build-armv7-unknown-linux-musleabihf-archive:
-  #   docker:
-  #     - image: timberiodev/vector-builder-armv7-unknown-linux-musleabihf:latest
-  #   resource_class: xlarge
-  #   steps:
-  #     - checkout
-  #     - run:
-  #         name: Build archive
-  #         command: |
-  #           export VERSION=$(make version)
-  #           export FEATURES="jemallocator"
-  #           make build-archive 
-  #     - persist_to_workspace:
-  #         root: target/artifacts
-  #         paths:
-  #           - "*-armv7-unknown-linux-musleabihf.tar.gz"
 
   build-x86_64-apple-darwin-archive:
     resource_class: large
@@ -144,58 +228,153 @@ jobs:
       - *install-rust
       - run:
           name: Build archive
+          no_output_timeout: 30m
           command: |
             export PATH="$HOME/.cargo/bin:$PATH"
-            export VERSION=$(make version)
             make build-archive
       - persist_to_workspace:
           root: target/artifacts
           paths:
             - "*-x86_64-apple-darwin.tar.gz"
 
-  build-x86_64-unknown-linux-gnu-archive:
-    docker:
-      - image: timberiodev/vector-builder-x86_64-unknown-linux-gnu:latest
-    resource_class: xlarge
+  build-x86_64-pc-windows-msvc-archive-and-msi-package:
+    executor: win/vs2019
     steps:
       - checkout
+      - *install-rust-windows
+      - run:
+          name: Download Perl
+          shell: bash
+          command: |
+            VERSION=5.30.0.1
+            # we need to verify checksum because strawberryperl.com doesn't support HTTPS
+            SHA256SUM=459de13a284a4c83213208c9caa1c372c81136b6e863a3f13d42f631048e0b12
+            curl -sSf http://strawberryperl.com/download/$VERSION/strawberry-perl-$VERSION-64bit.msi > perl-installer.msi
+            echo "$SHA256SUM perl-installer.msi" | sha256sum --check --status
+      - run:
+          name: Install Perl
+          shell: cmd.exe # msiexec fails when called from bash
+          command: |
+            msiexec /quiet /i perl-installer.msi
+            del perl-installer.msi
+      - run:
+          name: Download CMake
+          shell: bash
+          command: |
+            VERSION=3.15.5
+            curl -sSfL https://github.com/Kitware/CMake/releases/download/v$VERSION/cmake-$VERSION-win64-x64.msi > cmake-installer.msi
+      - run:
+          name: Install CMake
+          shell: cmd.exe # msiexec fails when called from bash
+          command: |
+            msiexec /quiet /i cmake-installer.msi
+            del cmake-installer.msi
+      - run:
+          name: Install WiX
+          shell: bash
+          command: |
+            mkdir -p /c/wix
+            cd /c/wix
+            curl -sSfL https://github.com/wixtoolset/wix3/releases/download/wix3112rtm/wix311-binaries.zip > wix-binaries.zip
+            unzip wix-binaries.zip
+            rm wix-binaries.zip
       - run:
           name: Build archive
+          shell: bash
+          no_output_timeout: 30m
           command: |
-            export VERSION=$(make version)
-            make build-archive
-      # We _must_ build the deb package on the same machine that created
-      # the binary. `cargo deb` performs dependency calculation via `ldd`
-      # and this process must happen on the same machine it was built in
-      # order to be accurate.
+            export PATH="$HOME/.cargo/bin:/c/Strawberry/perl/bin:/c/Program Files/CMake/bin:$PATH"
+            export RUSTFLAGS=-Ctarget-feature=+crt-static
+            export FEATURES="default-msvc"
+            export ARCHIVE_TYPE="zip"
+            export STRIP="false"
+            export RUST_LTO=""
+            export TARGET="x86_64-pc-windows-msvc"
+
+            ./scripts/build-archive.sh
+            ls -lha target/artifacts
       - run:
-          name: Build .deb package
+          name: Build MSI package
+          shell: bash
+          no_output_timeout: 30m
           command: |
-            export VERSION=$(make version)
-            make package-deb
+            export PATH="/c/wix:$PATH"
+            ./scripts/package-msi.sh
       - persist_to_workspace:
           root: target/artifacts
           paths:
-            - "*-x86_64-unknown-linux-gnu.tar.gz"
-            - "*-amd64.deb"
+            - "*-x86_64-pc-windows-msvc.zip"
+            - "vector-x64.msi"
 
-  build-x86_64-unknown-linux-musl-archive:
-    docker:
-      - image: timberiodev/vector-builder-x86_64-unknown-linux-musl:latest
-    resource_class: xlarge
+  build-x86_64-unknown-linux-musl-archive-and-deb-package:
+    <<: *docker-machine
     steps:
       - checkout
       - run:
-          name: Build archive
+          name: Build archive and .deb package
+          no_output_timeout: 30m
+          environment:
+            PASS_RUST_LTO: "lto"
+            PASS_FEATURES: "default-musl"
           command: |
-            export VERSION=$(make version)
-            export RUST_LTO="lto"
-            export TARGET="x86_64-unknown-linux-musl"
-            make build-archive
+            ./scripts/docker-run.sh builder-x86_64-unknown-linux-musl make build-archive package-deb
       - persist_to_workspace:
           root: target/artifacts
           paths:
             - "*-x86_64-unknown-linux-musl.tar.gz"
+            - "*-amd64.deb"
+
+  build-aarch64-unknown-linux-musl-archive-and-deb-package:
+    <<: *docker-machine
+    steps:
+      - checkout
+      - run:
+          name: Build archive and .deb package
+          no_output_timeout: 30m
+          environment:
+            PASS_RUST_LTO: "lto"
+            PASS_FEATURES: "default-musl"
+            DOCKER_PRIVILEGED: "true"
+          command: |
+            ./scripts/docker-run.sh builder-aarch64-unknown-linux-musl make build-archive package-deb
+      - persist_to_workspace:
+          root: target/artifacts
+          paths:
+            - "*-aarch64-unknown-linux-musl.tar.gz"
+            - "*-arm64.deb"
+
+  build-armv7-unknown-linux-musleabihf-archive-and-deb-package:
+    <<: *docker-machine
+    steps:
+      - checkout
+      - run:
+          name: Build archive and .deb package
+          no_output_timeout: 30m
+          environment:
+            PASS_RUST_LTO: "lto"
+            PASS_FEATURES: "default-musl"
+            DOCKER_PRIVILEGED: "true"
+          command: |
+            ./scripts/docker-run.sh builder-armv7-unknown-linux-musleabihf make build-archive package-deb
+      - persist_to_workspace:
+          root: target/artifacts
+          paths:
+            - "*-armv7-unknown-linux-musleabihf.tar.gz"
+            - "*-armhf.deb"
+
+  #
+  # Checks
+  #
+
+  check-remote-install-script:
+    machine: true
+    steps:
+      - run:
+          name: Install vector
+          command: curl -sSf https://sh.vector.dev | sh -s -- -y
+      - run:
+          name: Verify installation
+          command: vector --version
 
   #
   # Packaging
@@ -209,65 +388,62 @@ jobs:
   #
   # This is how I'd like the .deb packager to work as well, and I have a
   # feeling if we ditched `cargo deb` we could achieve this.
-  package-rpm:
-    docker:
-      - image: timberiodev/vector-packager-rpm:latest
+  package-rpm-x86_64-unknown-linux-musl:
+    <<: *docker-machine
     steps:
       - checkout
       - *restore-artifacts-from-workspace
       - run:
-          name: Build x86_64-unknown-linux-gnu .rpm package
+          name: Build x86_64-unknown-linux-musl .rpm package
           command: |
-            export VERSION=$(make version)
-            make package-rpm
+            ./scripts/docker-run.sh packager-rpm make package-rpm
           environment:
-            TARGET: x86_64-unknown-linux-gnu
+            PASS_TARGET: x86_64-unknown-linux-musl
       - persist_to_workspace:
           root: target/artifacts
           paths:
-            - "*.rpm"
+            - "*x86_64.rpm"
+
+  package-rpm-aarch64-unknown-linux-musl:
+    <<: *docker-machine
+    steps:
+      - checkout
+      - *restore-artifacts-from-workspace
+      - run:
+          name: Build aarch64-unknown-linux-musl .rpm package
+          command: |
+            ./scripts/docker-run.sh packager-rpm make package-rpm
+          environment:
+            PASS_TARGET: aarch64-unknown-linux-musl
+            DOCKER_PRIVILEGED: "true"
+      - persist_to_workspace:
+          root: target/artifacts
+          paths:
+            - "*aarch64.rpm"
+
+  package-rpm-armv7-unknown-linux-musleabihf:
+    <<: *docker-machine
+    steps:
+      - checkout
+      - *restore-artifacts-from-workspace
+      - run:
+          name: Build armv7-unknown-linux-musleabihf .rpm package
+          command: |
+            ./scripts/docker-run.sh packager-rpm make package-rpm
+          environment:
+            PASS_TARGET: armv7-unknown-linux-musleabihf
+            DOCKER_PRIVILEGED: "true"
+            PASS_ARCH: armv7hl
+      - persist_to_workspace:
+          root: target/artifacts
+          paths:
+            - "*armv7hl.rpm"
 
   #
   # Verifying
   #
 
-  verify-amazon-linux-1:
-    docker:
-      - image: timberiodev/vector-verifier-amazonlinux-1
-    steps:
-      - *restore-artifacts-from-workspace
-      - run:
-          name: Install .rpm package
-          command: rpm -i $(find target/artifacts/ -name *-x86_64.rpm)
-      - run:
-          name: Verify installation
-          command: vector --version
-
-  verify-amazon-linux-2:
-    docker:
-      - image: timberiodev/vector-verifier-amazonlinux-2
-    steps:
-      - *restore-artifacts-from-workspace
-      - run:
-          name: Install .rpm package
-          command: rpm -i $(find target/artifacts/ -name *-x86_64.rpm)
-      - run:
-          name: Verify installation
-          command: vector --version
-
-  verify-centos-7:
-    docker:
-      - image: centos:7
-    steps:
-      - *restore-artifacts-from-workspace
-      - run:
-          name: Install .rpm package
-          command: rpm -i $(find target/artifacts/ -name *-x86_64.rpm)
-      - run:
-          name: Verify installation
-          command: vector --version
-
-  verify-deb-8:
+  verify-deb-artifact-on-deb-8:
     docker:
       - image: timberiodev/vector-verifier-deb-8:latest
     steps:
@@ -279,7 +455,7 @@ jobs:
           name: Verify installation
           command: vector --version
 
-  verify-deb-9:
+  verify-deb-artifact-on-deb-9:
     docker:
       - image: timberiodev/vector-verifier-deb-9:latest
     steps:
@@ -291,7 +467,7 @@ jobs:
           name: Verify installation
           command: vector --version
 
-  verify-deb-10:
+  verify-deb-artifact-on-deb-10:
     docker:
       - image: timberiodev/vector-verifier-deb-10:latest
     steps:
@@ -303,124 +479,285 @@ jobs:
           name: Verify installation
           command: vector --version
 
-  verify-systemd:
+  verify-deb-artifact-on-ubuntu-16-04:
+    docker:
+      - image: timberiodev/vector-verifier-ubuntu-16-04:latest
+    steps:
+      - *restore-artifacts-from-workspace
+      - run:
+          name: Install .deb package
+          command: dpkg -i $(find target/artifacts/ -name *-amd64.deb)
+      - run:
+          name: Verify installation
+          command: vector --version
+
+  verify-deb-artifact-on-ubuntu-18-04:
+    docker:
+      - image: timberiodev/vector-verifier-ubuntu-18-04:latest
+    steps:
+      - *restore-artifacts-from-workspace
+      - run:
+          name: Install .deb package
+          command: dpkg -i $(find target/artifacts/ -name *-amd64.deb)
+      - run:
+          name: Verify installation
+          command: vector --version
+
+  verify-deb-artifact-on-ubuntu-19-04:
+    docker:
+      - image: timberiodev/vector-verifier-ubuntu-19-04:latest
+    steps:
+      - *restore-artifacts-from-workspace
+      - run:
+          name: Install .deb package
+          command: dpkg -i $(find target/artifacts/ -name *-amd64.deb)
+      - run:
+          name: Verify installation
+          command: vector --version
+
+  verify-zip-artifact-on-wine:
+    <<: *docker-machine
+    steps:
+      - checkout
+      - *restore-artifacts-from-workspace
+      - run:
+          name: Verify archive
+          command: |
+            ./scripts/docker-run.sh verifier-wine bash -x \<<EOF
+              mkdir -p dest
+              cd dest
+              unzip ../target/artifacts/*-x86_64-pc-windows-msvc.zip
+              wine ./bin/vector.exe --version
+            EOF
+
+  verify-docker:
+    <<: *docker-machine
+    steps:
+      - checkout
+      - *restore-artifacts-from-workspace
+      - run:
+          name: Build & verify Docker
+          environment:
+            PLATFORM: "linux/amd64,linux/arm64,linux/arm"
+          command: |
+            ./scripts/upgrade-docker.sh
+            export VERSION=$(make version)
+            make build-docker
+          no_output_timeout: 30m
+
+  verify-nixos:
+    <<: *docker-machine
+    steps:
+      - checkout
+      - run:
+          name: Test on NixOS
+          command: |
+            ./scripts/docker-run.sh verifier-nixos ./scripts/verify-nix.sh
+
+  test-install-script-on-amazon-linux-1:
+    docker:
+      - image: timberiodev/vector-verifier-amazonlinux-1:latest
+    steps:
+      - checkout
+      - *install-vector
+      - *test-install-script
+
+  test-install-script-on-amazon-linux-2:
+    docker:
+      - image: timberiodev/vector-verifier-amazonlinux-2:latest
+    steps:
+      - checkout
+      - *install-vector
+      - *test-install-script
+
+  test-install-script-on-centos-7:
+    docker:
+      - image: timberiodev/vector-verifier-centos-7:latest
+    steps:
+      - checkout
+      - *install-vector
+      - *test-install-script
+
+  test-install-script-on-deb-8:
+    docker:
+      - image: timberiodev/vector-verifier-deb-8:latest
+    steps:
+      - checkout
+      - *install-vector
+      - *test-install-script
+
+  test-install-script-on-deb-9:
+    docker:
+      - image: timberiodev/vector-verifier-deb-9:latest
+    steps:
+      - checkout
+      - *install-vector
+      - *test-install-script
+
+  test-install-script-on-deb-10:
+    docker:
+      - image: timberiodev/vector-verifier-deb-10:latest
+    steps:
+      - checkout
+      - *install-vector
+      - *test-install-script
+
+  test-install-script-on-mac-archive:
+    macos:
+      xcode: "9.0"
+    steps:
+      - checkout
+      - *install-vector
+      - *test-install-script
+
+  test-install-script-on-mac-homebrew:
+    macos:
+      xcode: "9.0"
+    steps:
+      - checkout
+      - run:
+          name: Install Homebrew
+          command: /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install.sh)"
+      - *install-vector
+      - *test-install-script
+
+  test-install-script-on-unbuntu-16-04:
+    docker:
+      - image: timberiodev/vector-verifier-ubuntu-16-04:latest
+    steps:
+      - checkout
+      - *install-vector
+      - *test-install-script
+
+  test-install-script-on-unbuntu-18-04:
+    docker:
+      - image: timberiodev/vector-verifier-ubuntu-18-04:latest
+    steps:
+      - checkout
+      - *install-vector
+      - *test-install-script
+
+  test-install-script-on-unbuntu-19-04:
+    docker:
+      - image: timberiodev/vector-verifier-ubuntu-19-04:latest
+    steps:
+      - checkout
+      - *install-vector
+      - *test-install-script
+
+  test-install-script-without-sudo:
+    machine: true
+    steps:
+      - checkout
+      - *install-vector
+      - *test-install-script
+
+  verify-rpm-artifact-on-amazon-linux-1:
+    docker:
+      - image: timberiodev/vector-verifier-amazonlinux-1:latest
+    steps:
+      - *restore-artifacts-from-workspace
+      - run:
+          name: Install .rpm package
+          command: rpm -i $(find target/artifacts/ -name *-x86_64.rpm)
+      - run:
+          name: Verify installation
+          command: vector --version
+
+  verify-rpm-artifact-on-amazon-linux-2:
+    docker:
+      - image: timberiodev/vector-verifier-amazonlinux-2:latest
+    steps:
+      - *restore-artifacts-from-workspace
+      - run:
+          name: Install .rpm package
+          command: rpm -i $(find target/artifacts/ -name *-x86_64.rpm)
+      - run:
+          name: Verify installation
+          command: vector --version
+
+  verify-rpm-artifact-on-centos-7:
+    docker:
+      - image: centos:7
+    steps:
+      - *restore-artifacts-from-workspace
+      - run:
+          name: Install .rpm package
+          command: rpm -i $(find target/artifacts/ -name *-x86_64.rpm)
+      - run:
+          name: Verify installation
+          command: vector --version
+
+  #
+  # Verifying systemd script
+  #
+
+  verify-systemd-on-debian:
     machine: true
     steps:
       - *restore-artifacts-from-workspace
       - run:
-          name: Install .deb package
-          command: dpkg -i $(find target/artifacts/ -name *-amd64.deb)
+          name: Install systemd
+          command: sudo apt-get install systemd
       - run:
-          name: Verify Systemd starts the service
+          name: Install .deb package
+          command: sudo dpkg -i $(find target/artifacts/ -name *-amd64.deb)
+      - run:
+          name: Start the Vector service
+          command: sudo systemctl start vector
+      - run:
+          name: Verify that the Vector service has started
           command: |
-            sudo systemctl start vector
-
-  verify-ubuntu-16-04:
-    docker:
-      - image: timberiodev/vector-verifier-ubuntu-16-04
-    steps:
-      - *restore-artifacts-from-workspace
-      - run:
-          name: Install .deb package
-          command: dpkg -i $(find target/artifacts/ -name *-amd64.deb)
-      - run:
-          name: Verify installation
-          command: vector --version
-
-  verify-ubuntu-18-04:
-    docker:
-      - image: timberiodev/vector-verifier-ubuntu-18-04
-    steps:
-      - *restore-artifacts-from-workspace
-      - run:
-          name: Install .deb package
-          command: dpkg -i $(find target/artifacts/ -name *-amd64.deb)
-      - run:
-          name: Verify installation
-          command: vector --version
-
-  verify-ubuntu-19-04:
-    docker:
-      - image: timberiodev/vector-verifier-ubuntu-19-04
-    steps:
-      - *restore-artifacts-from-workspace
-      - run:
-          name: Install .deb package
-          command: dpkg -i $(find target/artifacts/ -name *-amd64.deb)
-      - run:
-          name: Verify installation
-          command: vector --version
+            sleep 5
+            sudo systemctl status vector --full
+            sudo systemctl is-active vector
 
   #
   # Release
   #
 
-  release-deb:
-    docker:
-      - image: timberiodev/vector-releaser:latest
-    steps:
-      - checkout
-      - *restore-artifacts-from-workspace
-      - run:
-          name: Release deb
-          command: |
-            export VERSION=$(make version)
-            echo "Releasing $VERSION..."
-            make release-deb
-
   release-docker:
-    docker:
-      - image: timberiodev/vector-releaser:latest
+    machine:
+      image: ubuntu-1604:201903-01
+      docker_layer_caching: true
+    resource_class: large
     steps:
-      - setup_remote_docker:
-          docker_layer_caching: true
       - checkout
       - *restore-artifacts-from-workspace
       - run:
           name: Release Docker
+          environment:
+            PLATFORM: "linux/amd64,linux/arm64,linux/arm"
           command: |
+            ./scripts/upgrade-docker.sh
             export VERSION=$(make version)
-            echo "Releasing $VERSION..."
             make release-docker
+          no_output_timeout: 30m
 
   release-github:
-    docker:
-      - image: timberiodev/vector-releaser:latest
+    <<: *docker-machine
     steps:
       - checkout
       - *restore-artifacts-from-workspace
       - run:
           name: Release Github
           command: |
-            export VERSION=$(make version)
-            echo "Releasing $VERSION..."
-            make release-github
+            export PASS_VERSION=$(make version)
+            export PASS_CIRCLE_SHA1="$CIRCLE_SHA1"
+            export PASS_GITHUB_TOKEN="$GITHUB_TOKEN"
+            ./scripts/docker-run.sh releaser make release-github
 
   release-homebrew:
-    docker:
-      - image: timberiodev/vector-releaser:latest
+    <<: *docker-machine
     steps:
       - checkout
       - *restore-artifacts-from-workspace
       - run:
           name: Release Homebrew
           command: |
-            export VERSION=$(make version)
-            echo "Releasing $VERSION..."
-            make release-homebrew
-
-  release-rpm:
-    docker:
-      - image: timberiodev/vector-releaser:latest
-    steps:
-      - checkout
-      - *restore-artifacts-from-workspace
-      - run:
-          name: Release Github
-          command: |
-            export VERSION=$(make version)
-            echo "Releasing $VERSION..."
-            make release-rpm
+            export PASS_VERSION=$(make version)
+            export PASS_GITHUB_TOKEN="$GITHUB_TOKEN"
+            ./scripts/docker-run.sh releaser make release-homebrew
 
   release-s3:
     docker:
@@ -431,58 +768,69 @@ jobs:
       - run:
           name: Release S3
           command: |
-            export VERSION=$(make version)
             echo "Releasing $VERSION..."
             make release-s3
+
+  sync-install:
+    docker:
+      - image: timberiodev/vector-releaser:latest
+    steps:
+      - checkout
+      - run:
+          name: Sync install.sh
+          command: make sync-install
 
 #
 # Workflow Macros
 #
 
-test-filters: &test-filters
+prerelease-filters: &prerelease-filters
   filters:
     branches:
-      only: /.*/
-    tags:
-      ignore: /.*/
+      only: /prepare-.*/
 
-tag-workflow-filters: &tag-workflow-filters
+release-filters: &release-filters
   filters:
     branches:
       ignore: /.*/
     tags:
       only: /v.*/
 
-require-checks-and-tests: &require-checks-and-tests
+master-filters: &master-filters
+  filters:
+    branches:
+      only:
+        - master
+
+require-tests-checks-and-verifications: &require-tests-checks-and-verifications
   requires:
     - check-code
     - check-fmt
     - check-generate
+    - check-blog
     - test-stable
-
-require-builds: &require-builds
-  requires:
-    - build-armv7-unknown-linux-gnueabihf-archive
-    # - build-armv7-unknown-linux-musleabihf-archive
-    - build-x86_64-unknown-linux-gnu-archive
-    - build-x86_64-unknown-linux-musl-archive
+    # - test-stable-kubernetes
+    - build-x86_64-unknown-linux-musl-archive-and-deb-package
+    - build-aarch64-unknown-linux-musl-archive-and-deb-package
+    - build-armv7-unknown-linux-musleabihf-archive-and-deb-package
+    - package-rpm-x86_64-unknown-linux-musl
+    - package-rpm-aarch64-unknown-linux-musl
+    - package-rpm-armv7-unknown-linux-musleabihf
     - build-x86_64-apple-darwin-archive
+    - build-x86_64-pc-windows-msvc-archive-and-msi-package
+    - verify-deb-artifact-on-deb-8
+    - verify-deb-artifact-on-deb-9
+    - verify-deb-artifact-on-deb-10
+    - verify-deb-artifact-on-ubuntu-16-04
+    - verify-deb-artifact-on-ubuntu-18-04
+    - verify-deb-artifact-on-ubuntu-19-04
+    - verify-zip-artifact-on-wine
+    - verify-docker
+    - verify-rpm-artifact-on-amazon-linux-1
+    - verify-rpm-artifact-on-amazon-linux-2
+    - verify-rpm-artifact-on-centos-7
+    - verify-systemd-on-debian
 
-require-packages: &require-packages
-  requires:
-    - package-rpm
-
-require-verifies: &require-verifies
-  requires:
-    - verify-amazon-linux-1
-    - verify-amazon-linux-2
-    - verify-centos-7
-    - verify-deb-8
-    - verify-deb-9
-    - verify-deb-10
-    - verify-ubuntu-16-04
-    - verify-ubuntu-18-04
-    - verify-ubuntu-19-04
 
 #
 # Workflows
@@ -493,129 +841,326 @@ workflows:
 
   test:
     jobs:
-      - check-code:
-          <<: *test-filters
-      - check-fmt:
-          <<: *test-filters
-      - check-generate:
-          <<: *test-filters
-      - test-stable:
-          <<: *test-filters
-      - build-x86_64-unknown-linux-gnu-archive:
-          <<: *require-checks-and-tests
-      - build-x86_64-unknown-linux-musl-archive:
-          <<: *require-checks-and-tests
+      - check-code
+      - check-fmt
+      - check-generate
+      - check-blog
+      - check-version:
+          <<: *master-filters
+      - test-stable
+      # - test-stable-kubernetes
+      - test-x86_64-pc-windows-msvc:
+          <<: *prerelease-filters
+
+      # Build & verify
+
+      - build-x86_64-unknown-linux-musl-archive-and-deb-package:
+          <<: *prerelease-filters
+      - build-aarch64-unknown-linux-musl-archive-and-deb-package:
+          <<: *prerelease-filters
+      - build-armv7-unknown-linux-musleabihf-archive-and-deb-package:
+          <<: *prerelease-filters
       - build-x86_64-apple-darwin-archive:
-          <<: *require-checks-and-tests
+          <<: *prerelease-filters
+      - build-x86_64-pc-windows-msvc-archive-and-msi-package:
+          <<: *prerelease-filters
+      - package-rpm-x86_64-unknown-linux-musl:
+          <<: *prerelease-filters
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - package-rpm-aarch64-unknown-linux-musl:
+          <<: *prerelease-filters
+          requires:
+            - build-aarch64-unknown-linux-musl-archive-and-deb-package
+      - package-rpm-armv7-unknown-linux-musleabihf:
+          <<: *prerelease-filters
+          requires:
+            - build-armv7-unknown-linux-musleabihf-archive-and-deb-package
+
+      # Verify
+
+      - verify-deb-artifact-on-deb-8:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-deb-artifact-on-deb-9:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-deb-artifact-on-deb-10:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-deb-artifact-on-ubuntu-16-04:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-deb-artifact-on-ubuntu-18-04:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-deb-artifact-on-ubuntu-19-04:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-zip-artifact-on-wine:
+          requires:
+            - build-x86_64-pc-windows-msvc-archive-and-msi-package
+      - verify-docker:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+            - build-aarch64-unknown-linux-musl-archive-and-deb-package
+            - build-armv7-unknown-linux-musleabihf-archive-and-deb-package
+      - verify-rpm-artifact-on-amazon-linux-1:
+          requires:
+            - package-rpm-x86_64-unknown-linux-musl
+      - verify-rpm-artifact-on-amazon-linux-2:
+          requires:
+            - package-rpm-x86_64-unknown-linux-musl
+      - verify-rpm-artifact-on-centos-7:
+          requires:
+            - package-rpm-x86_64-unknown-linux-musl
+      - verify-systemd-on-debian:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+
+  release:
+    jobs:
+      - check-code:
+          <<: *release-filters
+      - check-fmt:
+          <<: *release-filters
+      - check-generate:
+          <<: *release-filters
+      - check-blog:
+          <<: *release-filters
+      - test-stable:
+          <<: *release-filters
+      # - test-stable-kubernetes:
+          # <<: *release-filters
+
+      # Build & verify
+
+      - build-x86_64-unknown-linux-musl-archive-and-deb-package:
+          <<: *release-filters
+      - build-aarch64-unknown-linux-musl-archive-and-deb-package:
+          <<: *release-filters
+      - build-armv7-unknown-linux-musleabihf-archive-and-deb-package:
+          <<: *release-filters
+      - build-x86_64-apple-darwin-archive:
+          <<: *release-filters
+      - build-x86_64-pc-windows-msvc-archive-and-msi-package:
+          <<: *release-filters
+      - package-rpm-x86_64-unknown-linux-musl:
+          <<: *release-filters
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - package-rpm-aarch64-unknown-linux-musl:
+          <<: *release-filters
+          requires:
+            - build-aarch64-unknown-linux-musl-archive-and-deb-package
+      - package-rpm-armv7-unknown-linux-musleabihf:
+          <<: *release-filters
+          requires:
+            - build-armv7-unknown-linux-musleabihf-archive-and-deb-package
+
+      # Verify
+
+      - verify-deb-artifact-on-deb-8:
+          <<: *release-filters
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-deb-artifact-on-deb-9:
+          <<: *release-filters
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-deb-artifact-on-deb-10:
+          <<: *release-filters
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-deb-artifact-on-ubuntu-16-04:
+          <<: *release-filters
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-deb-artifact-on-ubuntu-18-04:
+          <<: *release-filters
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-deb-artifact-on-ubuntu-19-04:
+          <<: *release-filters
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-zip-artifact-on-wine:
+          <<: *release-filters
+          requires:
+            - build-x86_64-pc-windows-msvc-archive-and-msi-package
+      - verify-docker:
+          <<: *release-filters
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+            - build-aarch64-unknown-linux-musl-archive-and-deb-package
+            - build-armv7-unknown-linux-musleabihf-archive-and-deb-package
+      - verify-rpm-artifact-on-amazon-linux-1:
+          <<: *release-filters
+          requires:
+            - package-rpm-x86_64-unknown-linux-musl
+      - verify-rpm-artifact-on-amazon-linux-2:
+          <<: *release-filters
+          requires:
+            - package-rpm-x86_64-unknown-linux-musl
+      - verify-rpm-artifact-on-centos-7:
+          <<: *release-filters
+          requires:
+            - package-rpm-x86_64-unknown-linux-musl
+      - verify-systemd-on-debian:
+          <<: *release-filters
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+
+      # Release
+
+      - release-docker:
+          <<: *release-filters
+          <<: *require-tests-checks-and-verifications
+      - release-github:
+          <<: *release-filters
+          <<: *require-tests-checks-and-verifications
+      - release-s3:
+          <<: *release-filters
+          <<: *require-tests-checks-and-verifications
+
+      # Must come after S3 since Homebrew installs from S3
+      - release-homebrew:
+          <<: *release-filters
+          requires:
+            - release-s3
 
   nightly:
     triggers:
       - schedule:
-          cron: "0 0 * * *"
-          filters:
-            branches:
-              only: master
+          cron: "0 14 * * *"
+          <<: *master-filters
 
     jobs:
       - check-code
       - check-fmt
       - check-generate
+      - check-blog
       - test-stable
-      - build-armv7-unknown-linux-gnueabihf-archive:
-          <<: *require-checks-and-tests
-      # - build-armv7-unknown-linux-musleabihf-archive:
-      #     <<: *tag-workflow-filters
-      #     <<: *require-checks-and-tests
-      - build-x86_64-unknown-linux-gnu-archive:
-          <<: *require-checks-and-tests
-      - build-x86_64-unknown-linux-musl-archive:
-          <<: *require-checks-and-tests
-      - build-x86_64-apple-darwin-archive:
-          <<: *require-checks-and-tests
-      - release-s3:
-          <<: *require-builds
-      # Installs directly from S3
-      - release-docker:
-          requires:
-            - release-s3
+      # - test-stable-kubernetes
 
-  tag:
-    jobs:
-      - check-code:
-          <<: *tag-workflow-filters
-      - check-fmt:
-          <<: *tag-workflow-filters
-      - check-generate:
-          <<: *tag-workflow-filters
-      - test-stable:
-          <<: *tag-workflow-filters
-      - build-armv7-unknown-linux-gnueabihf-archive:
-          <<: *tag-workflow-filters
-          <<: *require-checks-and-tests
-      # - build-armv7-unknown-linux-musleabihf-archive:
-      #     <<: *tag-workflow-filters
-      #     <<: *require-checks-and-tests
-      - build-x86_64-unknown-linux-gnu-archive:
-          <<: *tag-workflow-filters
-          <<: *require-checks-and-tests
-      - build-x86_64-unknown-linux-musl-archive:
-          <<: *tag-workflow-filters
-          <<: *require-checks-and-tests
-      - build-x86_64-apple-darwin-archive:
-          <<: *tag-workflow-filters
-          <<: *require-checks-and-tests
-      - package-rpm:
-          <<: *tag-workflow-filters
-          <<: *require-builds
-      - verify-amazon-linux-1:
-          <<: *tag-workflow-filters
-          <<: *require-packages
-      - verify-amazon-linux-2:
-          <<: *tag-workflow-filters
-          <<: *require-packages
-      - verify-centos-7:
-          <<: *tag-workflow-filters
-          <<: *require-packages
-      - verify-deb-8:
-          <<: *tag-workflow-filters
-          <<: *require-packages
-      - verify-deb-9:
-          <<: *tag-workflow-filters
-          <<: *require-packages
-      - verify-deb-10:
-          <<: *tag-workflow-filters
-          <<: *require-packages
-      - verify-ubuntu-16-04:
-          <<: *tag-workflow-filters
-          <<: *require-packages
-      - verify-ubuntu-18-04:
-          <<: *tag-workflow-filters
-          <<: *require-packages
-      - verify-ubuntu-19-04:
-          <<: *tag-workflow-filters
-          <<: *require-packages
-      - release-deb:
-          <<: *tag-workflow-filters
-          <<: *require-verifies
-      - release-github:
-          <<: *tag-workflow-filters
-          <<: *require-verifies
-      - release-rpm:
-          <<: *tag-workflow-filters
-          <<: *require-verifies
-      - release-s3:
-          <<: *tag-workflow-filters
-          <<: *require-verifies
-      # Installs directly from S3
+      # Build & verify
+
+      - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - build-aarch64-unknown-linux-musl-archive-and-deb-package
+      - build-armv7-unknown-linux-musleabihf-archive-and-deb-package
+      - build-x86_64-apple-darwin-archive
+      - build-x86_64-pc-windows-msvc-archive-and-msi-package
+      - package-rpm-x86_64-unknown-linux-musl:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - package-rpm-aarch64-unknown-linux-musl:
+          requires:
+            - build-aarch64-unknown-linux-musl-archive-and-deb-package
+      - package-rpm-armv7-unknown-linux-musleabihf:
+          requires:
+            - build-armv7-unknown-linux-musleabihf-archive-and-deb-package
+
+
+      # Verify
+
+      - verify-deb-artifact-on-deb-8:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-deb-artifact-on-deb-9:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-deb-artifact-on-deb-10:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-deb-artifact-on-ubuntu-16-04:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-deb-artifact-on-ubuntu-18-04:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-deb-artifact-on-ubuntu-19-04:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+      - verify-zip-artifact-on-wine:
+          requires:
+            - build-x86_64-pc-windows-msvc-archive-and-msi-package
+      - verify-docker:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+            - build-aarch64-unknown-linux-musl-archive-and-deb-package
+            - build-armv7-unknown-linux-musleabihf-archive-and-deb-package
+      - verify-rpm-artifact-on-amazon-linux-1:
+          requires:
+            - package-rpm-x86_64-unknown-linux-musl
+      - verify-rpm-artifact-on-amazon-linux-2:
+          requires:
+            - package-rpm-x86_64-unknown-linux-musl
+      - verify-rpm-artifact-on-centos-7:
+          requires:
+            - package-rpm-x86_64-unknown-linux-musl
+      - verify-systemd-on-debian:
+          requires:
+            - build-x86_64-unknown-linux-musl-archive-and-deb-package
+
+      # Release
+
       - release-docker:
-          <<: *tag-workflow-filters
+          <<: *require-tests-checks-and-verifications
+      - release-s3:
+          <<: *require-tests-checks-and-verifications
+
+  install-script:
+    jobs:
+      - test-install-script-on-amazon-linux-1:
+          <<: *prerelease-filters
+      - test-install-script-on-amazon-linux-2:
+          <<: *prerelease-filters
+      - test-install-script-on-centos-7:
+          <<: *prerelease-filters
+      - test-install-script-on-deb-8:
+          <<: *prerelease-filters
+      - test-install-script-on-deb-9:
+          <<: *prerelease-filters
+      - test-install-script-on-deb-10:
+          <<: *prerelease-filters
+      - test-install-script-on-mac-archive:
+          <<: *prerelease-filters
+      - test-install-script-on-mac-homebrew:
+          <<: *prerelease-filters
+      - test-install-script-on-unbuntu-16-04:
+          <<: *prerelease-filters
+      - test-install-script-on-unbuntu-18-04:
+          <<: *prerelease-filters
+      - test-install-script-on-unbuntu-19-04:
+          <<: *prerelease-filters
+      - test-install-script-without-sudo:
+          <<: *prerelease-filters
+
+      - sync-install:
+          <<: *master-filters
           requires:
-            - release-s3
-      # Installs directly from S3
-      - release-homebrew:
-          <<: *tag-workflow-filters
-          requires:
-            - release-s3
+            - test-install-script-on-amazon-linux-1
+            - test-install-script-on-amazon-linux-2
+            - test-install-script-on-centos-7
+            - test-install-script-on-deb-8
+            - test-install-script-on-deb-9
+            - test-install-script-on-deb-10
+            - test-install-script-on-mac-archive
+            - test-install-script-on-mac-homebrew
+            - test-install-script-on-unbuntu-16-04
+            - test-install-script-on-unbuntu-18-04
+            - test-install-script-on-unbuntu-19-04
+            - test-install-script-without-sudo
+
+  remote-checks:
+    triggers:
+      - schedule:
+          cron: "0 11 * * *"
+          <<: *master-filters
+
+    jobs:
+      - check-remote-install-script
+
 experimental:
   notify:
     branches:

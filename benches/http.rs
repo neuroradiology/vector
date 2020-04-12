@@ -1,11 +1,11 @@
 use criterion::{criterion_group, Benchmark, Criterion, Throughput};
-use futures::Future;
+use futures01::Future;
 use hyper::service::service_fn_ok;
 use hyper::{Body, Response, Server};
 use std::net::SocketAddr;
 use vector::test_util::{next_addr, random_lines, send_lines, wait_for_tcp};
 use vector::{
-    sinks, sources,
+    runtime, sinks, sources,
     topology::{self, config},
 };
 
@@ -22,18 +22,28 @@ fn benchmark_http_no_compression(c: &mut Criterion) {
         b.iter_with_setup(
             || {
                 let mut config = config::Config::empty();
-                config.add_source("in", sources::tcp::TcpConfig::new(in_addr));
+                config.add_source(
+                    "in",
+                    sources::socket::SocketConfig::make_tcp_config(in_addr),
+                );
                 config.add_sink(
                     "out",
                     &["in"],
                     sinks::http::HttpSinkConfig {
-                        uri: out_addr.to_string(),
+                        uri: out_addr.to_string().parse::<http::Uri>().unwrap().into(),
                         compression: Some(sinks::util::Compression::None),
-                        ..Default::default()
+                        method: Default::default(),
+                        healthcheck_uri: Default::default(),
+                        auth: Default::default(),
+                        headers: Default::default(),
+                        batch: Default::default(),
+                        encoding: sinks::http::Encoding::Text.into(),
+                        request: Default::default(),
+                        tls: Default::default(),
                     },
                 );
 
-                let mut rt = tokio::runtime::Runtime::new().unwrap();
+                let mut rt = runtime::Runtime::new().unwrap();
 
                 let (topology, _crash) = topology::start(config, &mut rt, false).unwrap();
                 wait_for_tcp(in_addr);
@@ -52,7 +62,7 @@ fn benchmark_http_no_compression(c: &mut Criterion) {
     })
     .sample_size(10)
     .noise_threshold(0.05)
-    .throughput(Throughput::Bytes((num_lines * line_size) as u32));
+    .throughput(Throughput::Bytes((num_lines * line_size) as u64));
 
     c.bench("http", bench);
 }
@@ -70,17 +80,28 @@ fn benchmark_http_gzip(c: &mut Criterion) {
         b.iter_with_setup(
             || {
                 let mut config = config::Config::empty();
-                config.add_source("in", sources::tcp::TcpConfig::new(in_addr));
+                config.add_source(
+                    "in",
+                    sources::socket::SocketConfig::make_tcp_config(in_addr),
+                );
                 config.add_sink(
                     "out",
                     &["in"],
                     sinks::http::HttpSinkConfig {
-                        uri: out_addr.to_string(),
-                        ..Default::default()
+                        uri: out_addr.to_string().parse::<http::Uri>().unwrap().into(),
+                        compression: Default::default(),
+                        method: Default::default(),
+                        healthcheck_uri: Default::default(),
+                        auth: Default::default(),
+                        headers: Default::default(),
+                        batch: Default::default(),
+                        encoding: sinks::http::Encoding::Text.into(),
+                        request: Default::default(),
+                        tls: Default::default(),
                     },
                 );
 
-                let mut rt = tokio::runtime::Runtime::new().unwrap();
+                let mut rt = runtime::Runtime::new().unwrap();
 
                 let (topology, _crash) = topology::start(config, &mut rt, false).unwrap();
                 wait_for_tcp(in_addr);
@@ -99,7 +120,7 @@ fn benchmark_http_gzip(c: &mut Criterion) {
     })
     .sample_size(10)
     .noise_threshold(0.05)
-    .throughput(Throughput::Bytes((num_lines * line_size) as u32));
+    .throughput(Throughput::Bytes((num_lines * line_size) as u64));
 
     c.bench("http", bench);
 }
@@ -112,7 +133,7 @@ fn serve(addr: SocketAddr) {
             .serve(make_service)
             .map_err(|e| panic!(e));
 
-        tokio::runtime::current_thread::run(fut);
+        tokio01::runtime::current_thread::run(fut);
     });
 }
 

@@ -1,14 +1,14 @@
 use super::Transform;
 use crate::{
-    event::metric::Metric,
-    event::{self, ValueKind},
+    event::metric::{Metric, MetricKind, MetricValue},
+    event::{self, Value},
     template::Template,
-    topology::config::{DataType, TransformConfig},
+    topology::config::{DataType, TransformConfig, TransformContext, TransformDescription},
     Event,
 };
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use string_cache::DefaultAtom as Atom;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -68,9 +68,13 @@ pub struct LogToMetric {
     config: LogToMetricConfig,
 }
 
+inventory::submit! {
+    TransformDescription::new_without_default::<LogToMetricConfig>("log_to_metric")
+}
+
 #[typetag::serde(name = "log_to_metric")]
 impl TransformConfig for LogToMetricConfig {
-    fn build(&self) -> Result<Box<dyn Transform>, String> {
+    fn build(&self, _cx: TransformContext) -> crate::Result<Box<dyn Transform>> {
         Ok(Box::new(LogToMetric::new(self.clone())))
     }
 
@@ -80,6 +84,10 @@ impl TransformConfig for LogToMetricConfig {
 
     fn output_type(&self) -> DataType {
         DataType::Metric
+    }
+
+    fn transform_type(&self) -> &'static str {
+        "log_to_metric"
     }
 }
 
@@ -109,11 +117,11 @@ fn render_template(s: &str, event: &Event) -> Result<String, TransformError> {
 fn render_tags(
     tags: &Option<IndexMap<Atom, String>>,
     event: &Event,
-) -> Option<HashMap<String, String>> {
+) -> Option<BTreeMap<String, String>> {
     match tags {
         None => None,
         Some(tags) => {
-            let mut map = HashMap::new();
+            let mut map = BTreeMap::new();
             for (name, value) in tags {
                 if let Ok(tag) = render_template(value, event) {
                     map.insert(name.to_string(), tag);
@@ -132,17 +140,18 @@ fn to_metric(config: &MetricConfig, event: &Event) -> Result<Metric, TransformEr
     let log = event.as_log();
 
     let timestamp = log
-        .get(&event::TIMESTAMP)
-        .and_then(ValueKind::as_timestamp)
+        .get(&event::log_schema().timestamp_key())
+        .and_then(Value::as_timestamp)
         .cloned();
 
     match config {
         MetricConfig::Counter(counter) => {
-            let val = log
+            let value = log
                 .get(&counter.field)
                 .ok_or(TransformError::FieldNotFound)?;
-            let val = if counter.increment_by_value {
-                val.to_string_lossy()
+            let value = if counter.increment_by_value {
+                value
+                    .to_string_lossy()
                     .parse()
                     .map_err(|_| TransformError::ParseError("counter value"))?
             } else {
@@ -154,16 +163,17 @@ fn to_metric(config: &MetricConfig, event: &Event) -> Result<Metric, TransformEr
 
             let tags = render_tags(&counter.tags, &event);
 
-            Ok(Metric::Counter {
+            Ok(Metric {
                 name,
-                val,
                 timestamp,
                 tags,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Counter { value },
             })
         }
         MetricConfig::Histogram(hist) => {
-            let val = log.get(&hist.field).ok_or(TransformError::FieldNotFound)?;
-            let val = val
+            let value = log.get(&hist.field).ok_or(TransformError::FieldNotFound)?;
+            let value = value
                 .to_string_lossy()
                 .parse()
                 .map_err(|_| TransformError::ParseError("histogram value"))?;
@@ -173,17 +183,20 @@ fn to_metric(config: &MetricConfig, event: &Event) -> Result<Metric, TransformEr
 
             let tags = render_tags(&hist.tags, &event);
 
-            Ok(Metric::Histogram {
+            Ok(Metric {
                 name,
-                val,
-                sample_rate: 1,
                 timestamp,
                 tags,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Distribution {
+                    values: vec![value],
+                    sample_rates: vec![1],
+                },
             })
         }
         MetricConfig::Gauge(gauge) => {
-            let val = log.get(&gauge.field).ok_or(TransformError::FieldNotFound)?;
-            let val = val
+            let value = log.get(&gauge.field).ok_or(TransformError::FieldNotFound)?;
+            let value = value
                 .to_string_lossy()
                 .parse()
                 .map_err(|_| TransformError::ParseError("gauge value"))?;
@@ -193,28 +206,31 @@ fn to_metric(config: &MetricConfig, event: &Event) -> Result<Metric, TransformEr
 
             let tags = render_tags(&gauge.tags, &event);
 
-            Ok(Metric::Gauge {
+            Ok(Metric {
                 name,
-                val,
-                direction: None,
                 timestamp,
                 tags,
+                kind: MetricKind::Absolute,
+                value: MetricValue::Gauge { value },
             })
         }
         MetricConfig::Set(set) => {
-            let val = log.get(&set.field).ok_or(TransformError::FieldNotFound)?;
-            let val = val.to_string_lossy();
+            let value = log.get(&set.field).ok_or(TransformError::FieldNotFound)?;
+            let value = value.to_string_lossy();
 
             let name = set.name.as_ref().unwrap_or(&set.field);
             let name = render_template(&name, &event)?;
 
             let tags = render_tags(&set.tags, &event);
 
-            Ok(Metric::Set {
+            Ok(Metric {
                 name,
-                val,
                 timestamp,
                 tags,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Set {
+                    values: vec![value].into_iter().collect(),
+                },
             })
         }
     }
@@ -235,11 +251,11 @@ impl Transform for LogToMetric {
                     output.push(Event::Metric(metric));
                 }
                 Err(TransformError::FieldNotFound) => {}
-                Err(TransformError::ParseError(message)) => {
-                    trace!("failed to parse {:?}", message);
+                Err(TransformError::ParseError(error)) => {
+                    debug!(message = "failed to parse.", %error, rate_limit_secs = 30);
                 }
-                Err(TransformError::RenderError(message)) => {
-                    trace!("{:?}", message);
+                Err(TransformError::RenderError(error)) => {
+                    debug!(message = "Unable to render.", %error, rate_limit_secs = 30);
                 }
             }
         }
@@ -250,9 +266,9 @@ impl Transform for LogToMetric {
 mod tests {
     use super::{LogToMetric, LogToMetricConfig};
     use crate::{
-        event::{self, Metric},
+        event::metric::{Metric, MetricKind, MetricValue},
+        event::{self, Event},
         transforms::Transform,
-        Event,
     };
     use chrono::{offset::TimeZone, DateTime, Utc};
 
@@ -266,9 +282,9 @@ mod tests {
 
     fn create_event(key: &str, value: &str) -> Event {
         let mut log = Event::from("i am a log");
-        log.as_mut_log().insert_explicit(key.into(), value.into());
+        log.as_mut_log().insert(key, value);
         log.as_mut_log()
-            .insert_implicit(event::TIMESTAMP.clone(), ts().into());
+            .insert(event::log_schema().timestamp_key().clone(), ts());
         log
     }
 
@@ -288,11 +304,12 @@ mod tests {
 
         assert_eq!(
             metric.into_metric(),
-            Metric::Counter {
+            Metric {
                 name: "status".into(),
-                val: 1.0,
                 timestamp: Some(ts()),
                 tags: None,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Counter { value: 1.0 },
             }
         );
     }
@@ -310,21 +327,16 @@ mod tests {
         );
 
         let mut event = create_event("message", "i am log");
-        event
-            .as_mut_log()
-            .insert_explicit("method".into(), "post".into());
-        event
-            .as_mut_log()
-            .insert_explicit("code".into(), "200".into());
+        event.as_mut_log().insert("method", "post");
+        event.as_mut_log().insert("code", "200");
 
         let mut transform = LogToMetric::new(config);
         let metric = transform.transform(event).unwrap();
 
         assert_eq!(
             metric.into_metric(),
-            Metric::Counter {
+            Metric {
                 name: "http_requests_total".into(),
-                val: 1.0,
                 timestamp: Some(ts()),
                 tags: Some(
                     vec![
@@ -335,6 +347,8 @@ mod tests {
                     .into_iter()
                     .collect(),
                 ),
+                kind: MetricKind::Incremental,
+                value: MetricValue::Counter { value: 1.0 },
             }
         );
     }
@@ -356,11 +370,12 @@ mod tests {
 
         assert_eq!(
             metric.into_metric(),
-            Metric::Counter {
+            Metric {
                 name: "exception_total".into(),
-                val: 1.0,
                 timestamp: Some(ts()),
                 tags: None,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Counter { value: 1.0 },
             }
         );
     }
@@ -401,11 +416,12 @@ mod tests {
 
         assert_eq!(
             metric.into_metric(),
-            Metric::Counter {
+            Metric {
                 name: "amount_total".into(),
-                val: 33.99,
                 timestamp: Some(ts()),
                 tags: None,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Counter { value: 33.99 },
             }
         );
     }
@@ -427,12 +443,12 @@ mod tests {
 
         assert_eq!(
             metric.into_metric(),
-            Metric::Gauge {
+            Metric {
                 name: "memory_rss_bytes".into(),
-                val: 123.0,
-                direction: None,
                 timestamp: Some(ts()),
                 tags: None,
+                kind: MetricKind::Absolute,
+                value: MetricValue::Gauge { value: 123.0 },
             }
         );
     }
@@ -490,13 +506,9 @@ mod tests {
         let mut event = Event::from("i am a log");
         event
             .as_mut_log()
-            .insert_implicit(event::TIMESTAMP.clone(), ts().into());
-        event
-            .as_mut_log()
-            .insert_explicit("status".into(), "42".into());
-        event
-            .as_mut_log()
-            .insert_explicit("backtrace".into(), "message".into());
+            .insert(event::log_schema().timestamp_key().clone(), ts());
+        event.as_mut_log().insert("status", "42");
+        event.as_mut_log().insert("backtrace", "message");
 
         let mut transform = LogToMetric::new(config);
 
@@ -505,20 +517,22 @@ mod tests {
         assert_eq!(2, output.len());
         assert_eq!(
             output.pop().unwrap().into_metric(),
-            Metric::Counter {
+            Metric {
                 name: "exception_total".into(),
-                val: 1.0,
                 timestamp: Some(ts()),
                 tags: None,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Counter { value: 1.0 },
             }
         );
         assert_eq!(
             output.pop().unwrap().into_metric(),
-            Metric::Counter {
+            Metric {
                 name: "status".into(),
-                val: 1.0,
                 timestamp: Some(ts()),
                 tags: None,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Counter { value: 1.0 },
             }
         );
     }
@@ -542,22 +556,12 @@ mod tests {
         let mut event = Event::from("i am a log");
         event
             .as_mut_log()
-            .insert_implicit(event::TIMESTAMP.clone(), ts().into());
-        event
-            .as_mut_log()
-            .insert_explicit("status".into(), "42".into());
-        event
-            .as_mut_log()
-            .insert_explicit("backtrace".into(), "message".into());
-        event
-            .as_mut_log()
-            .insert_implicit("host".into(), "local".into());
-        event
-            .as_mut_log()
-            .insert_implicit("worker".into(), "abc".into());
-        event
-            .as_mut_log()
-            .insert_implicit("service".into(), "xyz".into());
+            .insert(event::log_schema().timestamp_key().clone(), ts());
+        event.as_mut_log().insert("status", "42");
+        event.as_mut_log().insert("backtrace", "message");
+        event.as_mut_log().insert("host", "local");
+        event.as_mut_log().insert("worker", "abc");
+        event.as_mut_log().insert("service", "xyz");
 
         let mut transform = LogToMetric::new(config);
 
@@ -566,20 +570,24 @@ mod tests {
         assert_eq!(2, output.len());
         assert_eq!(
             output.pop().unwrap().into_metric(),
-            Metric::Counter {
+            Metric {
                 name: "xyz_exception_total".into(),
-                val: 1.0,
                 timestamp: Some(ts()),
                 tags: None,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Counter { value: 1.0 },
             }
         );
         assert_eq!(
             output.pop().unwrap().into_metric(),
-            Metric::Set {
+            Metric {
                 name: "local_abc_status_set".into(),
-                val: "42".into(),
                 timestamp: Some(ts()),
                 tags: None,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Set {
+                    values: vec!["42".into()].into_iter().collect()
+                },
             }
         );
     }
@@ -601,11 +609,14 @@ mod tests {
 
         assert_eq!(
             metric.into_metric(),
-            Metric::Set {
+            Metric {
                 name: "unique_user_ip".into(),
-                val: "1.2.3.4".into(),
                 timestamp: Some(ts()),
                 tags: None,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Set {
+                    values: vec!["1.2.3.4".into()].into_iter().collect()
+                },
             }
         );
     }
@@ -626,12 +637,15 @@ mod tests {
 
         assert_eq!(
             metric.into_metric(),
-            Metric::Histogram {
+            Metric {
                 name: "response_time".into(),
-                val: 2.5,
-                sample_rate: 1,
                 timestamp: Some(ts()),
                 tags: None,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Distribution {
+                    values: vec![2.5],
+                    sample_rates: vec![1],
+                },
             }
         );
     }

@@ -11,144 +11,435 @@
 #
 #   See the README.md in the generate folder for more details.
 
-Dir.chdir "scripts/generate"
-
 #
-# Require
+# Setup
 #
 
-require "erb"
-require "ostruct"
-require "rubygems"
-require "bundler"
-Bundler.require(:default)
+require 'uri'
+require_relative "setup"
 
-require_relative "generate/context"
-require_relative "generate/core_ext/hash"
-require_relative "generate/core_ext/object"
-require_relative "generate/core_ext/string"
-require_relative "generate/post_processors/component_presence_checker"
-require_relative "generate/post_processors/link_checker"
-require_relative "generate/post_processors/option_referencer"
+#
+# Requires
+#
+
+require_relative "generate/post_processors/component_importer"
+require_relative "generate/post_processors/front_matter_validator"
+require_relative "generate/post_processors/last_modified_setter"
+require_relative "generate/post_processors/link_definer"
+require_relative "generate/post_processors/option_linker"
+require_relative "generate/post_processors/section_referencer"
 require_relative "generate/post_processors/section_sorter"
-require_relative "generate/post_processors/toml_syntax_switcher"
+require_relative "generate/templates"
+
+#
+# Flags
+#
+
+dry_run = ARGV.include?("--dry-run")
+
+#
+# Constants
+#
+
+BLACKLISTED_SINKS = ["vector"]
+BLACKLISTED_SOURCES = ["vector"]
 
 #
 # Functions
 #
 
-def post_process(content, doc, links)
-  content = PostProcessors::TOMLSyntaxSwitcher.switch!(content)
-  content = PostProcessors::SectionSorter.sort!(content)
-  content = PostProcessors::OptionReferencer.reference!(content)
-  content = PostProcessors::LinkChecker.check!(content, doc, links)
+def doc_valid?(url_path)
+  parts = url_path.split("#", 2)
+  file_or_dir_path = WEBSITE_ROOT + parts[0][0..-1]
+  file_or_dir_path.delete_suffix!("/")
+  anchor = parts[1]
+  file_path =
+    if File.directory?(file_or_dir_path) && File.file?("#{file_or_dir_path}/README.md")
+      "#{file_or_dir_path}/README.md"
+    else
+      "#{file_or_dir_path}.md"
+    end
+
+  markdown_valid?(file_path, anchor)
+end
+
+def guide_valid?(url_path)
+  parts = url_path.split("#", 2)
+  file_or_dir_path = WEBSITE_ROOT + parts[0][0..-1]
+  file_or_dir_path.delete_suffix!("/")
+
+  if File.directory?(file_or_dir_path)
+    true
+  else
+    file_path = "#{file_or_dir_path}.md"
+    anchor = parts[1]
+    markdown_valid?(file_path, anchor)
+  end
+end
+
+def link_valid?(value)
+  if value.start_with?(DOCS_BASE_PATH)
+    doc_valid?(value)
+  elsif value.start_with?(GUIDES_BASE_PATH)
+    guide_valid?(value)
+  elsif value.start_with?("/")
+    page_valid?(value)
+  else
+    url_valid?(value)
+  end
+end
+
+def markdown_valid?(file_path, anchor)
+  if File.exists?(file_path)
+    if !anchor.nil?
+      content = File.read(file_path)
+      headings = content.scan(/\n###?#?#? (.*)\n/).flatten.uniq
+      anchors = headings.collect(&:parameterize)
+      anchors.include?(anchor)
+    else
+      true
+    end
+  else
+    false
+  end
+end
+
+def page_valid?(path)
+  uri = URI::parse(path)
+
+  path =
+    if uri.path == "/"
+      "/index"
+    elsif uri.path.end_with?("/")
+      uri.path[0..-2]
+    else
+      uri.path
+    end
+
+  File.exists?("#{PAGES_ROOT}#{path}.js")
+end
+
+def post_process(content, target_path, links)
+  if target_path.end_with?(".md")
+    content = content.clone
+    content = PostProcessors::ComponentImporter.import!(content)
+    content = PostProcessors::SectionSorter.sort!(content)
+    content = PostProcessors::SectionReferencer.reference!(content)
+    content = PostProcessors::OptionLinker.link!(content)
+    content = PostProcessors::LinkDefiner.define!(content, target_path, links)
+    # must be last
+    content = PostProcessors::LastModifiedSetter.set!(content, target_path)
+
+    PostProcessors::FrontMatterValidator.validate!(content, target_path)
+  end
+
   content
 end
 
-def render(template, context)
-  content = File.read(template)
-  renderer = ERB.new(content, nil, '-')
-  content = renderer.result(context.get_binding).lstrip.strip
+def url_valid?(url)
+  case url
+  # We add an exception for paths on packages.timber.io because the
+  # index.html file we use also serves as the error page. This is how
+  # it serves directories.
+  when /^https:\/\/packages\.timber\.io\/vector[^.]*$/
+    true
 
-  if template.end_with?(".md.erb")
-    notice =
+  # Some URLs, like download URLs, contain variables and are not meant
+  # to be validated.
+  when /<([A-Z_\-.]*)>/
+    true
+
+  else
+    uri = URI.parse(url)
+    req = Net::HTTP.new(uri.host, uri.port)
+    req.open_timeout = 500
+    req.read_timeout = 1000
+    req.ssl_timeout = 1000
+    req.use_ssl = true if uri.scheme == 'https'
+    path = uri.path == "" ? "/" : uri.path
+
+    begin
+      res = req.request_head(path)
+      res.code.to_i != 404
+    rescue Errno::ECONNREFUSED
+      return false
+    end
+  end
+end
+
+def write_new_file(path, contents)
+  if !File.exists?(path)
+    dirname = File.dirname(path)
+
+    unless File.directory?(dirname)
+      FileUtils.mkdir_p(dirname)
+    end
+
+    File.open(path, 'w+') { |file| file.write(contents) }
+  end
+end
+
+
+#
+# Header
+#
+
+Printer.title("Generating files...")
+
+#
+# Setup
+#
+
+metadata = Metadata.load!(META_ROOT, DOCS_ROOT, GUIDES_ROOT, PAGES_ROOT)
+templates = Templates.new(ROOT_DIR, metadata)
+
+#
+# Create missing platform integration guides
+#
+
+metadata.installation.platforms_list.each do |platform|
+  template_path = "#{GUIDES_ROOT}/integrate/platforms/#{platform.name}.md.erb"
+  strategy = platform.strategies.first
+  source = metadata.sources.send(strategy.source)
+
+  write_new_file(
+    template_path,
+    <<~EOF
+    <%- platform = metadata.installation.platforms.send("#{platform.name}") -%>
+    <%= integration_guide(platform: platform) %>
+    EOF
+  )
+
+  metadata.sinks_list.
+    select do |sink|
+      source.can_send_to?(sink) &&
+        !sink.function_category?("test") &&
+        !BLACKLISTED_SINKS.include?(sink.name)
+    end.
+    each do |sink|
+      template_path = "#{GUIDES_ROOT}/integrate/platforms/#{platform.name}/#{sink.name}.md.erb"
+
+      write_new_file(
+        template_path,
+        <<~EOF
+        <%- platform = metadata.installation.platforms.send("#{platform.name}") -%>
+        <%- sink = metadata.sinks.send("#{sink.name}") -%>
+        <%= integration_guide(platform: platform, sink: sink) %>
+        EOF
+      )
+    end
+end
+
+#
+# Create missing source integration guides
+#
+
+metadata.sources_list.
+  select { |s| !s.for_platform? && !BLACKLISTED_SOURCES.include?(s.name) }.
+  each do |source|
+    template_path = "#{GUIDES_ROOT}/integrate/sources/#{source.name}.md.erb"
+
+    write_new_file(
+      template_path,
       <<~EOF
-
-      <!--
-           THIS FILE IS AUTOGENERATED!
-
-           To make changes please edit the template located at:
-
-           scripts/generate/#{template}
-      -->
+      <%- source = metadata.sources.send("#{source.name}") -%>
+      <%= integration_guide(source: source) %>
       EOF
+    )
 
-    content.sub!(/\n# /, "#{notice}\n# ")
+    metadata.sinks_list.
+      select do |sink|
+        source.can_send_to?(sink) &&
+          !sink.function_category?("test") &&
+          !BLACKLISTED_SINKS.include?(sink.name)
+      end.
+      each do |sink|
+        template_path = "#{GUIDES_ROOT}/integrate/sources/#{source.name}/#{sink.name}.md.erb"
+
+        write_new_file(
+          template_path,
+          <<~EOF
+          <%- source = metadata.sources.send("#{source.name}") -%>
+          <%- sink = metadata.sinks.send("#{sink.name}") -%>
+          <%= integration_guide(source: source, sink: sink) %>
+          EOF
+        )
+      end
   end
 
-  content
-end
+#
+# Create missing sink integration guides
+#
 
-def say(words, color = nil)
-  if color
-    words = Paint[words, color]
+metadata.sinks_list.
+  select do |sink|
+    !sink.function_category?("test") &&
+      !BLACKLISTED_SINKS.include?(sink.name)
+  end.
+  each do |sink|
+    template_path = "#{GUIDES_ROOT}/integrate/sinks/#{sink.name}.md.erb"
+
+    write_new_file(
+      template_path,
+      <<~EOF
+      <%- sink = metadata.sinks.send("#{sink.name}") -%>
+      <%= integration_guide(sink: sink) %>
+      EOF
+    )
   end
 
-  puts "---> #{words}"
+#
+# Create missing release pages
+#
+
+metadata.releases_list.each do |release|
+  template_path = "#{PAGES_ROOT}/releases/#{release.version}/download.js"
+
+  write_new_file(
+    template_path,
+    <<~EOF
+    import React from 'react';
+
+    import ReleaseDownload from '@site/src/components/ReleaseDownload';
+
+    function Download() {
+      return <ReleaseDownload version="#{release.version}" />
+    }
+
+    export default Download;
+    EOF
+  )
+
+  template_path = "#{PAGES_ROOT}/releases/#{release.version}.js"
+
+  write_new_file(
+    template_path,
+    <<~EOF
+    import React from 'react';
+
+    import ReleaseNotes from '@site/src/components/ReleaseNotes';
+
+    function ReleaseNotesPage() {
+      const version = "#{release.version}";
+
+      return <ReleaseNotes version={version} />;
+    }
+
+    export default ReleaseNotesPage;
+    EOF
+  )
 end
 
 #
-# Vars
+# Create missing component templates
 #
 
-VECTOR_DOCS_HOST = "https://docs.vector.dev"
-VECTOR_ROOT = File.join(Dir.pwd.split(File::SEPARATOR)[0..-3])
-DOCS_ROOT = File.join(VECTOR_ROOT, "docs")
-metadata = Metadata.load()
-CHECK_URLS = ARGV.any? { |arg| arg == "--check-urls" }
+metadata.components.each do |component|
+  template_path = "#{REFERENCE_ROOT}/#{component.type.pluralize}/#{component.name}.md.erb"
+
+  if !File.exists?(template_path)
+    contents = templates.component_default(component)
+    File.open(template_path, 'w+') { |file| file.write(contents) }
+  end
+end
+
+erb_paths =
+  Dir.glob("#{ROOT_DIR}/**/*.erb", File::FNM_DOTMATCH).
+  to_a.
+  filter { |path| !path.start_with?("#{ROOT_DIR}/scripts") }.
+  filter { |path| !path.start_with?("#{ROOT_DIR}/distribution/nix") }
+
+#
+# Create missing .md files
+#
+
+erb_paths.each do |erb_path|
+  md_path = erb_path.gsub(/\.erb$/, "")
+  if !File.exists?(md_path)
+    File.open(md_path, "w") {}
+  end
+end
 
 #
 # Render templates
 #
 
-puts ""
-puts "Generating files"
-puts ""
+metadata = Metadata.load!(META_ROOT, DOCS_ROOT, GUIDES_ROOT, PAGES_ROOT)
+templates = Templates.new(ROOT_DIR, metadata)
 
-context = Context.new(metadata)
-templates = Dir.glob("templates/**/*.erb", File::FNM_DOTMATCH).to_a
-templates.each do |template|
-  basename = File.basename(template)
-
-  # Skip partials
-  if !basename.start_with?("_")
-    content = render(template, context)
-    target = template.gsub(/^templates\//, "#{VECTOR_ROOT}/").gsub(/\.erb$/, "")
-    content = post_process(content, target, metadata.links)
-    current_content = File.read(target)
+erb_paths.
+  select { |path| !templates.partial?(path) }.
+  each do |template_path|
+    target_file = template_path.gsub(/^#{ROOT_DIR}\//, "").gsub(/\.erb$/, "")
+    target_path = "#{ROOT_DIR}/#{target_file}"
+    content = templates.render(target_file)
+    content = post_process(content, target_path, metadata.links)
+    current_content = File.read(target_path)
 
     if current_content != content
-      action = false ? "Will be changed" : "Changed"
-      say("#{action} - #{target.gsub("../../", "")}", :green)
-      File.write(target, content)
+      action = dry_run ? "Will be changed" : "Changed"
+      Printer.say("#{action} - #{target_file}", color: :green)
+      File.write(target_path, content) if !dry_run
     else
-      action = false ? "Will not be changed" : "Not changed"
-      say("#{action} - #{target.gsub("../../", "")}", :blue)
+      action = dry_run ? "Will not be changed" : "Not changed"
+      Printer.say("#{action} - #{target_file}", color: :blue)
     end
   end
+
+if dry_run
+  return
 end
-
-#
-# Check component presence
-#
-
-docs = Dir.glob("#{DOCS_ROOT}/usage/configuration/sources/*.md").to_a
-PostProcessors::ComponentPresenceChecker.check!("sources", docs, metadata.sources)
-
-docs = Dir.glob("#{DOCS_ROOT}/usage/configuration/transforms/*.md").to_a
-PostProcessors::ComponentPresenceChecker.check!("transforms", docs, metadata.transforms)
-
-docs = Dir.glob("#{DOCS_ROOT}/usage/configuration/sinks/*.md").to_a
-PostProcessors::ComponentPresenceChecker.check!("sinks", docs, metadata.sinks)
 
 #
 # Post process individual docs
 #
 
-puts ""
-puts "Post process"
-puts ""
+Printer.title("Post processing generated files...")
 
-docs = Dir.glob("#{DOCS_ROOT}/**/*.md").to_a
-docs = docs + ["#{VECTOR_ROOT}/README.md"]
-docs = docs - ["#{DOCS_ROOT}/SUMMARY.md"]
+docs =
+  Dir.glob("#{DOCS_ROOT}/**/*.md").to_a +
+    Dir.glob("#{POSTS_ROOT}/**/*.md").to_a +
+    ["#{ROOT_DIR}/README.md"]
+
 docs.each do |doc|
-  content = File.read(doc)
-  if content.include?("THIS FILE IS AUTOGENERATED")
-    say("Skipped - #{doc}", :blue)
+  path = doc.gsub(/^#{ROOT_DIR}\//, "")
+  original_content = File.read(doc)
+  new_content = post_process(original_content, doc, metadata.links)
+
+  if original_content != new_content
+    File.write(doc, new_content)
+    Printer.say("Processed - #{path}", color: :green)
   else
-    content = post_process(content, doc, metadata.links)
-    File.write(doc, content)
-    say("Processed - #{doc}", :green)
+    Printer.say("Not changed - #{path}", color: :blue)
+  end
+end
+
+#
+# Check URLs
+#
+
+check_urls =
+  if ENV.key?("CHECK_URLS")
+    ENV.fetch("CHECK_URLS") == "true"
+  else
+    Printer.title("Checking URLs...")
+    Printer.get("Would you like to check & verify URLs?", ["y", "n"]) == "y"
+  end
+
+if check_urls
+  Parallel.map(metadata.links.values.to_a.sort, in_threads: 50) do |id, value|
+    if !link_valid?(value)
+      Printer.error!(
+        <<~EOF
+        Link `#{id}` invalid!
+
+          #{value}
+
+        Please make sure this path or URL exists.
+        EOF
+      )
+    else
+      Printer.say("Valid - #{id} - #{value}", color: :green)
+    end
   end
 end
